@@ -1,0 +1,79 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: dbos-poc
+  namespace: dbos-poc
+spec:
+  replicas: __REPLICAS__
+  selector:
+    matchLabels:
+      app: dbos-poc
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      # All old pods must drain simultaneously. Under maxUnavailable: 1 the first
+      # old pod waits on work owned by old pods that are still running normally
+      # and still creating more, and the rollout deadlocks.
+      maxSurge: 100%
+      maxUnavailable: 0
+  template:
+    metadata:
+      labels:
+        app: dbos-poc
+        # Read by poc/k8s.py: this is how the API server answers "which executors
+        # of version X are alive". It must stay in sync with the image tag.
+        version: "__VERSION__"
+    spec:
+      # INVARIANT: preStop + drain + margin <= grace.
+      #   preStop 10s + drain 1460s + margin 30s = 1500s
+      # The ceiling has to cover the longest backlog still running when the next
+      # version lands: 3 pods x 1 parent x 10 children x 10 steps x up to 10s,
+      # over the 6 concurrent slots the old pods still have (3 x worker
+      # concurrency 2), is about 8 minutes worst case. It is a safety ceiling,
+      # not the primary lever — the drain exits as soon as the version empties,
+      # so a quiet deploy is still fast.
+      terminationGracePeriodSeconds: 1500
+      serviceAccountName: dbos-poc
+      initContainers:
+        - name: wait-for-postgres
+          image: postgres:17-alpine
+          command:
+            ["sh", "-c", "until pg_isready -h postgres -U dbos -d dbos_poc; do sleep 1; done"]
+      containers:
+        - name: app
+          image: __IMAGE__
+          imagePullPolicy: Never
+          lifecycle:
+            preStop:
+              exec:
+                # Runs INSIDE the grace period; SIGTERM arrives only after it returns.
+                command: ["/bin/sh", "-c", "sleep 10"]
+          env:
+            - name: DBOS_SYSTEM_DATABASE_URL
+              value: postgresql://dbos:dbos@postgres:5432/dbos_poc?sslmode=disable
+            # DBOS derives executor_id from DBOS__VMID, falling back to the shared
+            # literal "local". An executor id identifies one running process, so
+            # every replica needs its own: with a shared id, a starting pod's
+            # recovery claims PENDING work that a live sibling is still running.
+            # The app does not invent an id; it feeds DBOS's own variable.
+            - name: DBOS__VMID
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            # The same name again, under the app's own setting, so the pod can
+            # recognise its own rows and derive stable workflow ids.
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: POD_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+          # No probes. Nothing routes traffic here — work arrives through the
+          # queue — so there is no readiness to gate, and a liveness probe would
+          # risk restarting a pod in the middle of a drain.
+          resources:
+            requests:
+              cpu: 100m
+              memory: 256Mi
