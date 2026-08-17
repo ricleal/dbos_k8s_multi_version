@@ -43,11 +43,6 @@ def init_dbos(s: Settings) -> None:
         # From pyproject.toml, never from the environment: the version has to
         # travel with the code it describes.
         "application_version": project_version(),
-        # Tag this pod's connections with the id DBOS will use, so
-        # pg_stat_activity becomes a live-executor index for poc/executors.py.
-        "db_engine_kwargs": {
-            "connect_args": {"application_name": DBOS.executor_id},
-        },
     }
 
     DBOS(config=config)

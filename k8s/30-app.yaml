@@ -24,8 +24,8 @@ spec:
         # of version X are alive". It must stay in sync with the image tag.
         version: "__VERSION__"
     spec:
-      # INVARIANT: preStop + drain + margin <= grace.
-      #   preStop 10s + drain 1460s + margin 30s = 1500s
+      # INVARIANT: drain + margin <= grace.
+      #   drain 1470s + margin 30s = 1500s
       # The ceiling has to cover the longest backlog still running when the next
       # version lands: 3 pods x 1 parent x 10 children x 10 steps x up to 10s,
       # over the 6 concurrent slots the old pods still have (3 x worker
@@ -37,20 +37,36 @@ spec:
       initContainers:
         - name: wait-for-postgres
           image: postgres:17-alpine
+          env:
+            - name: POSTGRES_USER
+              valueFrom:
+                secretKeyRef: { name: dbos-poc-db, key: POSTGRES_USER }
+            - name: POSTGRES_DB
+              valueFrom:
+                secretKeyRef: { name: dbos-poc-db, key: POSTGRES_DB }
           command:
-            ["sh", "-c", "until pg_isready -h postgres -U dbos -d dbos_poc; do sleep 1; done"]
+            - sh
+            - -c
+            - until pg_isready -h postgres -U "$POSTGRES_USER" -d "$POSTGRES_DB"; do sleep 1; done
       containers:
         - name: app
           image: __IMAGE__
           imagePullPolicy: Never
-          lifecycle:
-            preStop:
-              exec:
-                # Runs INSIDE the grace period; SIGTERM arrives only after it returns.
-                command: ["/bin/sh", "-c", "sleep 10"]
+          # No preStop hook. It existed to delay SIGTERM while a Service dropped
+          # this pod from its endpoints; there is no Service, so it only ever
+          # delayed the drain — and a hook outlasting the grace period gives the
+          # kubelet a shutdown it cannot complete on time.
+          volumeMounts:
+            # The database URL arrives as a file, not an environment variable:
+            # k8s/05-secret.yaml projected at /app/.env, which is exactly where
+            # pydantic-settings looks (`env_file=".env"` in poc/config.py, and
+            # the image's WORKDIR is /app). subPath mounts the single file
+            # without shadowing the rest of /app.
+            - name: dotenv
+              mountPath: /app/.env
+              subPath: .env
+              readOnly: true
           env:
-            - name: DBOS_SYSTEM_DATABASE_URL
-              value: postgresql://dbos:dbos@postgres:5432/dbos_poc?sslmode=disable
             # DBOS derives executor_id from DBOS__VMID, falling back to the shared
             # literal "local". An executor id identifies one running process, so
             # every replica needs its own: with a shared id, a starting pod's
@@ -77,3 +93,13 @@ spec:
             requests:
               cpu: 100m
               memory: 256Mi
+      volumes:
+        - name: dotenv
+          secret:
+            secretName: dbos-poc-db
+            defaultMode: 0440
+            # Only the dotenv key. Without this the POSTGRES_* fields would be
+            # projected too, and the app has no business reading them.
+            items:
+              - key: .env
+                path: .env

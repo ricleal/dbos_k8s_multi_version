@@ -56,7 +56,6 @@ def drain_to_empty(s: Settings, stop_supervisor: threading.Event) -> int:
         elapsed=round(_elapsed(), 1),
         budget_sec=s.drain_budget_sec,
         grace_sec=s.grace_period_sec,
-        prestop_sleep_sec=s.prestop_sleep_sec,
         drain_margin_sec=s.drain_margin_sec,
     )
 

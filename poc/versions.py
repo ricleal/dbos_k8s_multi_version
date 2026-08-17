@@ -64,9 +64,28 @@ def recover_orphaned_workflows(version: str, namespace: str) -> int:
     claimed by a specific executor, and if that executor is gone nothing will
     ever release it.
 
-    Recovery re-enqueues in place: the workflow id and every completed step
-    survive, and the UPDATE is predicated on the dead executor ids, so two pods
-    sweeping the same corpse is safe.
+    What ``_recover_pending_workflows`` does, since "recover" oversells it: it
+    executes nothing. Per executor id it selects the PENDING rows matching that
+    executor *and this process's version*, then flips each back to ENQUEUED,
+    clearing ``started_at_epoch_ms`` and defaulting ``queue_name`` to the
+    internal queue for workflows that were started off-queue. That is the whole
+    operation — the work runs later, when some live worker of that version
+    dequeues it through the ordinary atomic ENQUEUED->PENDING handoff, which
+    admits exactly one runner.
+
+    Re-enqueueing happens *in place*: same workflow id, so the checkpoints in
+    ``operation_outputs`` still apply. When the workflow does run again it
+    replays from the top, and every completed step returns its recorded output
+    instead of executing. A workflow that died on step 7 of 10 does not redo
+    steps 1-6. A new workflow id would mean starting over, which is why recovery
+    reuses the old one.
+
+    The UPDATE is predicated on the dead executor ids, so once a live worker
+    dequeues a row its executor id changes and a duplicate recovery call matches
+    nothing. Two pods sweeping the same corpse is therefore safe.
+
+    The handles returned are polling handles — a promise to watch the database,
+    not evidence that anything ran. Their count is the number of rows released.
 
     Must be called with this process's own version. ``recover_pending_workflows``
     filters on ``GlobalParams.app_version``, so asking it to recover another

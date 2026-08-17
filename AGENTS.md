@@ -25,13 +25,14 @@ pointing at the `docker-desktop` context.
 
 | Command | What it does |
 |---|---|
-| `make infra` | Namespace, Postgres StatefulSet, RBAC (pods: get/list) |
+| `make infra` | Namespace, credentials Secret, Postgres StatefulSet, RBAC (pods: get/list) |
 | `make build` | `docker build` then import the image into the node's containerd |
 | `make deploy` | Render `k8s/30-app.yaml` for the current version and apply it |
 | `make bump` | Bump `project.version` — this *is* the DBOS application version |
 | `make status` | Pods with their version label, plus work grouped by version and status |
 | `make logs` | Follow every app pod |
-| `make reset` | Delete the app and drop the `dbos` schema, keeping Postgres |
+| `make dbos_reset` | Drop the system database via `dbos reset` inside a live app pod |
+| `make reset` | `dbos_reset`, then delete the app, keeping Postgres |
 | `make clean` | Delete the namespace and the Postgres volume |
 | `uv run ruff check . && uv run ruff format .` | Lint and format |
 | `uv run ty check main.py poc/` | Type check |
@@ -62,7 +63,7 @@ DBOS_SYSTEM_DATABASE_URL="postgresql://trustle:trustle@localhost:5432/dbos_poc?s
 | [poc/workflows.py](poc/workflows.py) | The workload: one parent, N children, many slow steps |
 | [poc/config.py](poc/config.py) | `Settings`; every field is an environment variable |
 | [poc/logs.py](poc/logs.py) | structlog, with executor id and version on every event |
-| [k8s/](k8s/) | Namespace, Postgres, RBAC, and the Deployment template |
+| [k8s/](k8s/) | Namespace, credentials Secret, Postgres, RBAC, and the Deployment template |
 | [.github/copilot-instructions.md](.github/copilot-instructions.md) | Vendored DBOS API reference — consult before using an unfamiliar DBOS call |
 
 ## Invariants
@@ -80,6 +81,20 @@ Breaking any of these reintroduces a bug that has already been hit once.
 - **The application version comes from `pyproject.toml` and nowhere else.** Not
   an environment variable: a version settable from outside can disagree with the
   code in the image.
+- **Database credentials live only in `k8s/05-secret.yaml`.** The app reads them
+  from `/app/.env`, projected from that Secret; do not reintroduce a connection
+  string into the Deployment, the Makefile, or the image.
+- **No `preStop` hook, and never one longer than the grace period.** A hook the
+  kubelet cannot finish in time wedges the shutdown: containers keep running for
+  as long as 25 minutes after their pod object is gone, invisible to the API but
+  still dequeuing work and stamping their executor id on it. The hook here only
+  ever existed to let a Service drop the pod from its endpoints, and there is no
+  Service.
+- **Tear-down deletes pods with a short grace period, not `--force`.** Once the
+  system database is dropped there is nothing to drain, so waiting out the 1500s
+  grace is pointless — but `--force --grace-period=0` removes the pod object
+  without waiting for the kubelet to kill anything, which is how ghosts are
+  made. `--grace-period=5` guarantees a SIGKILL behind the SIGTERM.
 - **`DBOS.register_queue` runs after `DBOS.launch()`**, never at import time.
 - **Workflow bodies must be deterministic.** Anything a loop bound depends on is
   a checkpointed argument, not a settings read — see the docstring on
@@ -89,7 +104,7 @@ Breaking any of these reintroduces a bug that has already been hit once.
 - **`maxSurge: 100%` with `maxUnavailable: 0`.** Under `maxUnavailable: 1` the
   first old pod waits on work owned by old pods that are still running and still
   creating more, and the rollout deadlocks.
-- **`preStop + drain budget + margin <= terminationGracePeriodSeconds`.**
+- **`drain budget + margin <= terminationGracePeriodSeconds`.**
   Asserted by a validator in `Settings`; the manifest comment must agree.
 
 ## Conventions

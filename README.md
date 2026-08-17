@@ -98,7 +98,7 @@ The pod is held open during the drain by `terminationGracePeriodSeconds`, under
 an invariant asserted at startup:
 
 ```
-preStop (10s) + drain budget (1460s) + margin (30s) <= grace (1500s)
+drain budget (1470s) + margin (30s) <= grace (1500s)
 ```
 
 The budget is a ceiling, not the primary lever — the drain exits the moment the
@@ -128,18 +128,32 @@ nowhere else, so it cannot disagree with the code in the image.
 | Target | What it does |
 |---|---|
 | `make help` | List the targets, and print the current version and replica count. The default goal. |
-| `make infra` | Create the namespace, the Postgres StatefulSet, and the RBAC the app needs (`get`/`list` on pods). Waits for Postgres to be ready. |
+| `make infra` | Create the namespace, the credentials Secret, the Postgres StatefulSet, and the RBAC the app needs (`get`/`list` on pods). Waits for Postgres to be ready. |
 | `make build` | `docker build` the image as `dbos-poc:$(VERSION)`, then import it into the node's containerd — Docker Desktop's Kubernetes node has its own image store, which is why `imagePullPolicy: Never` works. |
 | `make deploy` | Render `k8s/30-app.yaml` into `.rendered/app-$(VERSION).yaml` and apply it. Does not build. Returns immediately; old pods keep draining in the background. |
 | `make bump` | Bump the patch version in `pyproject.toml`. This is the only place the application version is defined. |
 | `make version` | Print the project version, which is the DBOS application version. |
 | `make status` | Pods with their `version` label, then work counted by version and status straight out of `dbos.workflow_status`. The ground truth for everything below. |
 | `make logs` | Follow every app pod at once. |
-| `make reset` | Delete the Deployment (and its old ReplicaSets) and drop the `dbos` schema. Keeps Postgres and its volume, so the next deploy starts from an empty database. |
+| `make dbos_reset` | Drop the DBOS system database by running `dbos reset` inside a live app pod. Needs a running Deployment, and says so if there is none. |
+| `make reset` | `dbos_reset`, then delete the Deployment and its old ReplicaSets. Keeps Postgres and its volume, so the next deploy starts from an empty database. |
 | `make clean` | Delete the whole namespace, including the Postgres volume, and remove `.rendered/`. |
 
 Variables you can override: `REPLICAS` (default 3), `NS` (default `dbos-poc`),
 `NODE` (default `desktop-control-plane`, the Docker Desktop node container).
+
+### Credentials
+
+The database credentials live in exactly one place, [k8s/05-secret.yaml](k8s/05-secret.yaml).
+Postgres reads the individual fields from it; the app gets the composed URL as a
+dotenv file projected at `/app/.env`, which is where `env_file=".env"` in
+[poc/config.py](poc/config.py) already looks. No connection string appears in the
+Deployment, the Makefile, or the image.
+
+A Secret is base64, not encryption. Committing this one is only acceptable
+because these are throwaway credentials for a local cluster — for anything real,
+create it out of band with `kubectl create secret` or manage it with SOPS or
+External Secrets.
 
 To run outside Kubernetes (no liveness oracle, so recovery is skipped):
 

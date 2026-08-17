@@ -32,19 +32,27 @@ spec:
         - name: postgres
           image: postgres:17-alpine
           env:
+            # From k8s/05-secret.yaml, not written here. Named individually
+            # rather than with envFrom: the Secret also carries a `.env` key for
+            # the app, and that is not a valid environment variable name.
             - name: POSTGRES_USER
-              value: dbos
+              valueFrom:
+                secretKeyRef: { name: dbos-poc-db, key: POSTGRES_USER }
             - name: POSTGRES_PASSWORD
-              value: dbos
+              valueFrom:
+                secretKeyRef: { name: dbos-poc-db, key: POSTGRES_PASSWORD }
             - name: POSTGRES_DB
-              value: dbos_poc
+              valueFrom:
+                secretKeyRef: { name: dbos-poc-db, key: POSTGRES_DB }
             - name: PGDATA
               value: /var/lib/postgresql/data/pgdata
           ports:
             - containerPort: 5432
           readinessProbe:
             exec:
-              command: ["pg_isready", "-U", "dbos", "-d", "dbos_poc"]
+              # sh -c so the credentials come from the container's environment
+              # instead of being repeated here.
+              command: ["sh", "-c", 'pg_isready -U "$POSTGRES_USER" -d "$POSTGRES_DB"']
             periodSeconds: 3
           volumeMounts:
             - name: data

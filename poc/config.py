@@ -31,9 +31,6 @@ class Settings(BaseSettings):
     grace_period_sec: int = 1500
     """Mirrors the pod's terminationGracePeriodSeconds."""
 
-    prestop_sleep_sec: int = 10
-    """Mirrors the container's preStop hook, which runs INSIDE the grace period."""
-
     drain_margin_sec: int = 30
     """Headroom left for destroy() and process exit after the drain loop."""
 
@@ -69,14 +66,14 @@ class Settings(BaseSettings):
     @property
     def drain_budget_sec(self) -> int:
         """Seconds the drain loop may run before Kubernetes SIGKILLs the pod."""
-        return self.grace_period_sec - self.prestop_sleep_sec - self.drain_margin_sec
+        return self.grace_period_sec - self.drain_margin_sec
 
     @model_validator(mode="after")
     def _check_drain_budget(self) -> "Settings":
         if self.drain_budget_sec <= 0:
             raise ValueError(
-                "invariant violated: preStop + margin must leave room under the grace "
-                f"period (grace={self.grace_period_sec}s prestop={self.prestop_sleep_sec}s "
-                f"margin={self.drain_margin_sec}s -> budget={self.drain_budget_sec}s)"
+                "invariant violated: the margin must leave room under the grace period "
+                f"(grace={self.grace_period_sec}s margin={self.drain_margin_sec}s "
+                f"-> budget={self.drain_budget_sec}s)"
             )
         return self

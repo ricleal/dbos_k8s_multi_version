@@ -13,7 +13,5 @@ RUN uv sync --frozen --no-dev
 COPY main.py ./
 COPY poc ./poc
 
-EXPOSE 8080
-
 # Exec form, no shell wrapper: the interpreter is PID 1 and receives SIGTERM directly.
 ENTRYPOINT ["/app/.venv/bin/python", "main.py"]
