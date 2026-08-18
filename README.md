@@ -50,6 +50,11 @@ composition. Liveness comes from the Kubernetes API — a pod object exists or i
 does not — rather than from watching database connections, which flicker and
 therefore need a debounce window.
 
+One rule keeps that oracle honest: **unknown is not none.**
+`k8s.live_pods_by_version` returns `None` when the API cannot be reached, never
+an empty dict. An empty dict means "the cluster says there are no pods", which
+would license declaring every executor dead.
+
 ```python
 recover_orphaned_workflows(version, namespace) -> int
 ```
@@ -58,7 +63,12 @@ pod is handed to `DBOS._recover_pending_workflows()`. Only `PENDING` rows need
 help: an `ENQUEUED` row's `executor_id` is merely whoever enqueued it, and the
 dequeue predicate is the version, so a live sibling already picks those up.
 
-Never treats itself as dead, whatever the API says — see *Gotchas*.
+**A pod never classifies itself as dead**, whatever the API says.
+`kubectl delete pod --force --grace-period=0` removes the pod object while the
+process behind it is still running, so a sweep that trusted the API here would
+see its own name missing, declare itself dead, and re-enqueue the workflows it
+was in the middle of executing — handing them to a second runner while the first
+kept going. `DBOS.executor_id` is unioned into the live set unconditionally.
 
 ```python
 drain_version(version) -> int                 # 0 means drained
@@ -173,8 +183,8 @@ drain budget (1470s) + margin (30s) <= grace (1500s)
 ```
 
 Size the grace period from the worst-case backlog, not from a default. Here:
-3 pods × 1 parent × 10 children × 10 steps × up to 10s, over the 6 concurrent
-slots the old pods still have, is about 8 minutes. The budget is a ceiling — the
+3 pods × 1 parent × 15 children × 15 steps × up to 3s, over the 6 concurrent
+slots the old pods still have, is about 6 minutes. The budget is a ceiling — the
 drain exits the moment the version empties, so a deploy into an idle fleet is
 immediate.
 
@@ -343,6 +353,14 @@ Watch Terminal 1 until the old version has a real backlog — around
 of 15 steps, so three pods produce **48 workflows**, roughly four minutes of work
 over the six concurrent slots the fleet has (3 replicas x `worker_concurrency` 2).
 
+That size is deliberate, and it is the first thing to check if a scenario below
+shows nothing. Under `maxUnavailable: 0` no old pod is sent SIGTERM until the new
+pods are `Ready`, which on a laptop cluster can take 90 seconds. A backlog
+shorter than that finishes on its own before the drain ever begins: the old pods
+report `remaining_active=0` on their first poll and exit immediately, with
+nothing in flight to demonstrate. The workload constants in
+[poc/config.py](poc/config.py) are sized against exactly that.
+
 Now roll forward, mid-flight:
 
 ```bash
@@ -398,6 +416,33 @@ FROM dbos.workflow_status GROUP BY 1,2 ORDER BY 1,2;
 Zero crossover. Every workflow finished on a pod of the version it started
 against, and nothing was lost, cancelled or replayed against the wrong code.
 
+### An aside: how to actually kill a pod
+
+The next two scenarios both depend on a pod dying, and the obvious command does
+not do that.
+
+**`kubectl delete pod --force --grace-period=0` does not stop anything.** It
+removes the pod object and returns immediately, which reads like a kill but is
+not one: the container keeps running, keeps dequeuing, and keeps stamping its
+executor id on work. Measured here, a version whose last pod object had been
+force-deleted went on to finish all 48 of its workflows over the next four
+minutes, with `make status` reporting zero pods the whole time. It cannot produce
+the stranded-version scenario, and in tear-down it is how ghosts are made.
+
+Neither obvious alternative helps. `kubectl exec -- kill -9 1` cannot work: the
+kernel discards a SIGKILL sent to PID 1 from inside its own PID namespace. And
+re-deleting a pod with `--grace-period=1` does not shorten a grace period that is
+already running — against pods that were mid-drain the command simply blocked for
+83 seconds until the drain finished on its own, then returned as if it had done
+something.
+
+So there are two usable kills, and the scenarios below use one each:
+
+| | Command | Effect |
+|---|---|---|
+| **Live pod** | `kubectl delete pod <name> --grace-period=1` | SIGTERM, then SIGKILL a second later. The process really dies, the pod object goes, and the ReplicaSet starts a replacement. Used by 1.1. |
+| **Terminating pod** | `make kill_version VER=x.y.z` | Kills the container through the node's CRI, from outside the pod's PID namespace. No SIGTERM, no drain. Used by 1.2. |
+
 ### Scenario 1.1 — a pod dies, siblings are alive
 
 Reset and start a single version:
@@ -406,8 +451,8 @@ Reset and start a single version:
 make reset && make deploy
 ```
 
-Once Terminal 1 shows a backlog, kill one pod. Use a short grace period rather
-than `--force`, for the reason in *Gotchas* below:
+Once Terminal 1 shows a backlog, kill one pod — a short grace period, not
+`--force`:
 
 ```bash
 kubectl -n dbos-poc delete pod <name> --grace-period=1
@@ -444,8 +489,8 @@ from the executor breakdown entirely — its three `PENDING` workflows moved to
 
 ### Scenario 1.2 — a version with no pods left
 
-This one needs the old version's processes to be genuinely dead, which is more
-awkward than it sounds — see *Gotchas*. `make kill_version` does it.
+This one needs the old version's processes to be genuinely dead, which is why
+`make kill_version` exists — see the aside above.
 
 ```bash
 make reset
@@ -500,49 +545,6 @@ filter, so racing observers are harmless and no leader election is needed.
 make reset          # empty database, app removed, Postgres kept
 make clean          # delete the namespace and the Postgres volume
 ```
-
-## Gotchas found the hard way
-
-**A dying pod must never classify itself as dead.** `kubectl delete pod --force
---grace-period=0` removes the pod object while its process is still running. A
-sweep that trusted the API here would see its own name missing, declare itself
-dead, and re-enqueue the workflows it was in the middle of executing — handing
-them to a second runner while the first kept going. `recover_orphaned_workflows`
-unions `DBOS.executor_id` into the live set unconditionally.
-
-**Unknown is not none.** `k8s.live_pods_by_version` returns `None` when the API
-cannot be reached, never an empty dict. An empty dict means "the cluster says
-there are no pods", which would license declaring every executor dead.
-
-**`maxUnavailable: 0` with `maxSurge: 100%` is load-bearing.** Under
-`maxUnavailable: 1` the first old pod waits on work owned by old pods that are
-still running normally and still creating more, and the rollout deadlocks.
-
-**`--force --grace-period=0` does not stop anything.** It removes the pod object
-and returns immediately, which reads like a kill but is not one: the container
-keeps running, keeps dequeuing, and keeps stamping its executor id on work.
-Measured here, a version whose last pod object had been force-deleted went on to
-finish all 48 of its workflows over the next four minutes, with `make status`
-reporting zero pods the whole time. So it cannot produce the stranded-version
-scenario, and in tear-down it is how ghosts are made.
-
-Neither obvious alternative helps. `kubectl exec -- kill -9 1` cannot work: the
-kernel discards a SIGKILL sent to PID 1 from inside its own PID namespace. And
-re-deleting a pod with `--grace-period=1` does not shorten a grace period that is
-already running — against pods that were mid-drain the command simply blocked for
-83 seconds until the drain finished on its own, then returned as if it had done
-something. A short grace period only bites on the *first* delete, which is why
-scenario 1.1 above uses it on a live pod and scenario 1.2 does not.
-
-Killing the process for real means going through the node's CRI, from outside the
-pod's PID namespace, which is what `make kill_version` does.
-
-**The backlog has to outlast the rollout.** Under `maxUnavailable: 0` an old pod
-is not sent SIGTERM until the new pods are `Ready`, which on a laptop cluster can
-take 90 seconds. A backlog shorter than that finishes on its own before the drain
-ever starts: the old pods drain in one poll, report `remaining_active=0`, and the
-demo shows nothing. The workload constants in
-[poc/config.py](poc/config.py) are sized for this — about four minutes of work.
 
 ## Known limitations
 
