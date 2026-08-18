@@ -524,10 +524,18 @@ keeps running, keeps dequeuing, and keeps stamping its executor id on work.
 Measured here, a version whose last pod object had been force-deleted went on to
 finish all 48 of its workflows over the next four minutes, with `make status`
 reporting zero pods the whole time. So it cannot produce the stranded-version
-scenario, and in tear-down it is how ghosts are made. `kubectl exec -- kill -9 1`
-is no better: the kernel discards a SIGKILL sent to PID 1 from inside its own PID
-namespace. Killing the process for real means going through the node's CRI, which
-is what `make kill_version` does.
+scenario, and in tear-down it is how ghosts are made.
+
+Neither obvious alternative helps. `kubectl exec -- kill -9 1` cannot work: the
+kernel discards a SIGKILL sent to PID 1 from inside its own PID namespace. And
+re-deleting a pod with `--grace-period=1` does not shorten a grace period that is
+already running — against pods that were mid-drain the command simply blocked for
+83 seconds until the drain finished on its own, then returned as if it had done
+something. A short grace period only bites on the *first* delete, which is why
+scenario 1.1 above uses it on a live pod and scenario 1.2 does not.
+
+Killing the process for real means going through the node's CRI, from outside the
+pod's PID namespace, which is what `make kill_version` does.
 
 **The backlog has to outlast the rollout.** Under `maxUnavailable: 0` an old pod
 is not sent SIGTERM until the new pods are `Ready`, which on a laptop cluster can
