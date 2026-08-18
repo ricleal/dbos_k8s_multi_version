@@ -16,6 +16,29 @@ Each pod is a DBOS executor (`DBOS.executor_id`). A workflow row in
 Both are recorded when the workflow is created, and both constrain who can pick
 it up later. That is what makes a fleet of pods interesting.
 
+---
+
+**If you are here to understand the mechanism**, read
+[The two problems](#the-two-problems) → [What DBOS already guarantees](#what-dbos-already-guarantees)
+→ [Rolling deployments with new versions](#rolling-deployments-with-new-versions),
+which is self-contained and is the part worth reusing.
+
+**If you are here to run it**, skip to [Running it](#running-it) and
+[Demo](#demo).
+
+| | |
+|---|---|
+| [The two problems](#the-two-problems) | Why executor id and application version each break a fleet |
+| [What DBOS already guarantees](#what-dbos-already-guarantees) | Four facts from the `dbos` source that decide the design |
+| [What this PoC adds](#what-this-poc-adds) | The four functions, and the process lifecycle |
+| [With and without Conductor](#with-and-without-conductor) | Which half of this you can delete if you pay for Conductor |
+| [Rolling deployments with new versions](#rolling-deployments-with-new-versions) | **The version mechanism in full.** Standalone |
+| [Running it](#running-it) | Prerequisites, `make` targets, credentials |
+| [Demo](#demo) | Three scenarios with real captured output |
+| [Known limitations](#known-limitations) | What this does not solve |
+
+---
+
 ## The two problems
 
 **1. Executor id.** Kubernetes gives each pod a random name, and that name is the
@@ -32,16 +55,20 @@ old pods before they go.
 
 ## What DBOS already guarantees
 
-Three facts, read out of the installed `dbos` 2.29 source, decide most of the
-design. They are worth knowing before writing any code, because two of the three
-problems above need no code at all.
+Four facts, read out of the installed `dbos` 2.29 source, decide most of the
+design. They are worth knowing before writing any code, because the dangerous
+half of problem 2 needs no code at all.
 
 | Fact | Where | Consequence |
 |---|---|---|
-| Dequeue is version-scoped: `application_version == mine` (plus NULL rows, and only if you are the latest version) | `_sys_db.py`, `start_queued_workflows` | Old work **cannot** leak onto new pods. Requirement 2's safety property is free. |
+| Dequeue is version-scoped: `application_version == mine` (plus NULL rows, and only if you are the latest version) | `_sys_db.py`, `start_queued_workflows` | Old work **cannot** leak onto new pods. Problem 2's safety property is free. |
 | Recovery is version-scoped too — `recover_pending_workflows` filters on `GlobalParams.app_version` | `_recovery.py` | Only a live pod **of that same version** can adopt orphaned work. This is why 1.2 has no in-process fix. |
 | Re-enqueue is predicated on the dead executor ids | `_sys_db.py`, `reenqueue_for_recovery` | Two pods sweeping the same corpse is safe. No leader election needed. |
 | `create_application_version` is `on_conflict_do_nothing` | `_sys_db.py` | An old pod restarting never re-claims "latest", so `get_latest_application_version() != mine` is a reliable retirement signal. |
+
+The first two rows are the whole basis of the version half, and
+[Rolling deployments with new versions](#rolling-deployments-with-new-versions)
+unpacks them.
 
 ## What this PoC adds
 
@@ -75,9 +102,8 @@ drain_version(version) -> int                 # 0 means drained
 ```
 **Problem 2.** How much active work this version still owns. Pure DBOS: no
 Kubernetes API, no liveness oracle, no orphan recovery — a single query against
-`dbos.workflow_status`. The version half of this PoC is deliberately independent
-of the executor half, and it is the part worth stealing; see
-[Rolling deployments with new versions](#rolling-deployments-with-new-versions).
+`dbos.workflow_status`. It is the part worth stealing, and it gets a section to
+itself: [Rolling deployments with new versions](#rolling-deployments-with-new-versions).
 
 ```python
 recover_and_drain_version(version, namespace) -> int
@@ -101,6 +127,21 @@ pod of any version may do it, and it is idempotent, so racing observers are fine
 
 The supervisor thread runs 1.1 and 1.2 every `sweep_interval_sec`, including
 while the pod is draining. `main.py` runs 2 on SIGTERM.
+
+### Lifecycle
+
+```
+launch ── register queue ── start parents (only if this is the latest version)
+   │
+   ├── supervisor thread, every 5s:  recover orphans (mine) + cancel stranded (others)
+   │
+   └── SIGTERM ── recover_and_drain_version(mine) until 0 or budget ── destroy() ── exit
+                  exit 0 = clean, exit 75 = truncated (work left behind)
+```
+
+There is no HTTP server. Nothing routes traffic to these pods — work arrives
+through the queue — so the readiness probe was gating traffic that does not
+exist, and `main()` starts the workflow directly instead of via `GET /start`.
 
 ## With and without Conductor
 
@@ -169,31 +210,6 @@ it likes; here the drain is bounded by `terminationGracePeriodSeconds`, and
 anything still unfinished when that expires is left to
 `cancel_stranded_versions`. If your workflows can run for hours, prefer DBOS's
 pattern — or raise the grace period, which is the same lever.
-
-## Lifecycle
-
-```
-launch ── register queue ── start parents (only if this is the latest version)
-   │
-   ├── supervisor thread, every 5s:  recover orphans (mine) + cancel stranded (others)
-   │
-   └── SIGTERM ── recover_and_drain_version(mine) until 0 or budget ── destroy() ── exit
-                  exit 0 = clean, exit 75 = truncated (work left behind)
-```
-
-There is no HTTP server. Nothing routes traffic to these pods — work arrives
-through the queue — so the readiness probe was gating traffic that does not
-exist, and `main()` starts the workflow directly instead of via `GET /start`.
-
-The pod is held open during the drain by `terminationGracePeriodSeconds`, under
-an invariant asserted at startup:
-
-```
-drain budget (1470s) + margin (30s) <= grace (1500s)
-```
-
-The budget is a ceiling, not the primary lever — the drain exits the moment the
-version empties, so a quiet deploy is still fast.
 
 ## Rolling deployments with new versions
 
@@ -277,19 +293,13 @@ make bump && make build && make deploy
 The old pods go `Terminating` but keep working — SIGTERM starts the drain, it
 does not stop the queue pollers — while the new pods start and immediately begin
 taking new work. Both versions run side by side for the length of the drain, each
-touching only its own rows. In the log:
+touching only its own rows, until the old pods report
+`DRAIN_RESULT outcome=clean` and exit `0`.
 
-```
-drain poll  remaining_active=48  application_version=0.1.7  poll_number=3
-drain poll  remaining_active=31  application_version=0.1.7  poll_number=14
-drain poll  remaining_active=0   application_version=0.1.7  poll_number=35
-DRAIN_RESULT  outcome=clean  drain_seconds=170.4  remaining_active=0
-```
-
-Observed on a 48-workflow backlog: all 48 of the old version finished on
-old-version pods, all 48 of the new version on new-version pods. Zero crossover.
-`make status` groups the `dbos` schema by version and status and is the ground
-truth throughout. [Demo](#demo) has the full walk-through.
+Measured on a 48-workflow backlog: the old pods drained for 170s, then all 48 of
+the old version had finished on old-version pods and all 48 of the new version on
+new-version pods. **Zero crossover.** [Demo → Scenario 2](#scenario-2--rolling-deployment-the-main-event)
+has the commands, the logs and the queries.
 
 ### When the budget runs out
 
@@ -320,8 +330,8 @@ To cut a new version and roll it out:
 make bump && make build && make deploy
 ```
 
-The application version comes from `project.version` in `pyproject.toml` and
-nowhere else, so it cannot disagree with the code in the image.
+`make bump` edits `project.version` in `pyproject.toml`, which *is* the
+application version — see [rule 1](#the-four-things-that-make-it-work-on-kubernetes).
 
 ### Makefile targets
 
@@ -616,12 +626,14 @@ make clean          # delete the namespace and the Postgres volume
 
 ## Known limitations
 
-- The stranded-version timer lives in each pod's memory, so an observer restart
-  restarts the clock. That errs towards waiting longer, never towards cancelling
-  early.
-- `drain_version` waits for the version to be globally empty. That is right for a
-  version upgrade, but conservative for a *same-version* restart (a config-only
-  change): the retiring pods also wait on work the replacement pods create.
-- A truncated drain (exit 75) leaves active rows on a retired version. Those are
-  exactly what `cancel_stranded_versions` finds once the last pod of that version
-  is gone — so unfinished work is cancelled rather than silently abandoned.
+- **The stranded-version timer is in memory.** An observer restart restarts the
+  clock, so a version can wait longer than `stranded_grace_sec` before its work
+  is cancelled. That errs towards waiting, never towards cancelling early.
+- **The drain is conservative for a same-version restart** — see
+  [When the budget runs out](#when-the-budget-runs-out).
+- **A truncated drain is bounded, not silent** — same section.
+- **Liveness is inferred from pod objects.** A pod object can be removed while
+  its process still runs (see [the aside in the demo](#an-aside-how-to-actually-kill-a-pod)),
+  so a sibling can adopt work an executor is still executing. `cancel_stranded_versions`
+  and the self-never-dead rule bound the damage, but Conductor's health signal is
+  a better oracle than this one.
