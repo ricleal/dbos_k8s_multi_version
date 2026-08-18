@@ -30,7 +30,8 @@ pointing at the `docker-desktop` context.
 | `make deploy` | Render `k8s/30-app.yaml` for the current version and apply it |
 | `make bump` | Bump `project.version` — this *is* the DBOS application version |
 | `make status` | Pods with their version label, plus work grouped by version and status |
-| `make logs` | Follow every app pod |
+| `make logs` | Follow every app pod. Exits when those pods go; re-run after a rollout |
+| `make kill_version VER=x.y.z` | Hard-kill that version's containers through the node's CRI — the only way to actually strand a version |
 | `make dbos_reset` | Drop the system database via `dbos reset` inside a live app pod |
 | `make reset` | `dbos_reset`, then delete the app, keeping Postgres |
 | `make clean` | Delete the namespace and the Postgres volume |
@@ -43,14 +44,26 @@ Cut and roll out a new version with `make bump && make build && make deploy`.
 
 There is no automated test suite. Verification is behavioural, against a live
 cluster, and the `dbos` schema is the ground truth — `make status` throughout.
-The three scenarios and their expected observations are documented under
-*Reproducing the three scenarios* in [README.md](README.md). Re-run all three
-after touching `poc/versions.py`, `poc/k8s.py`, `main.py`, or `k8s/30-app.yaml`.
+The three scenarios, the terminal layout and the expected output are documented
+under *Demo* in [README.md](README.md). Re-run all three after touching
+`poc/versions.py`, `poc/k8s.py`, `main.py`, or `k8s/30-app.yaml`.
+
+Two things make these scenarios fail to reproduce, both learned the hard way:
+
+- **The backlog must outlast the rollout.** Under `maxUnavailable: 0` no old pod
+  gets SIGTERM until the new pods are `Ready` — up to 90s on a laptop cluster. A
+  shorter backlog drains itself before the drain starts, and every scenario
+  degenerates to `remaining_active=0` on the first poll. The workload constants
+  in `poc/config.py` are sized for this; do not shrink them without checking.
+- **`--force --grace-period=0` does not kill the process.** It removes the pod
+  object only; the container keeps running and finishes the work. Use
+  `make kill_version` to strand a version, and `--grace-period=1` to orphan one
+  pod's rows.
 
 A local run needs no cluster (liveness is unavailable, so recovery is skipped):
 
 ```bash
-DBOS_SYSTEM_DATABASE_URL="postgresql://trustle:trustle@localhost:5432/dbos_poc?sslmode=disable" uv run python main.py
+DBOS_SYSTEM_DATABASE_URL="postgresql://dbos:dbos@localhost:5432/dbos_poc?sslmode=disable" uv run python main.py
 ```
 
 ## Layout
@@ -58,7 +71,7 @@ DBOS_SYSTEM_DATABASE_URL="postgresql://trustle:trustle@localhost:5432/dbos_poc?s
 | Path | Role |
 |---|---|
 | [main.py](main.py) | Lifecycle: launch, start work, supervise, drain on SIGTERM |
-| [poc/versions.py](poc/versions.py) | The three functions: recover orphans, drain a version, cancel stranded work |
+| [poc/versions.py](poc/versions.py) | Recover orphans, drain a version, cancel stranded work, and the composition of the first two |
 | [poc/k8s.py](poc/k8s.py) | Read-only pod listing — the liveness oracle |
 | [poc/workflows.py](poc/workflows.py) | The workload: one parent, N children, many slow steps |
 | [poc/config.py](poc/config.py) | `Settings`; every field is an environment variable |

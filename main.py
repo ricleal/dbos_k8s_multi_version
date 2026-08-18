@@ -61,7 +61,10 @@ def drain_to_empty(s: Settings, stop_supervisor: threading.Event) -> int:
 
     polls = 0
     while True:
-        remaining = versions.drain_version(version, s.pod_namespace)
+        # Recovery is composed in here, not inside drain_version: the drain is
+        # pure DBOS, and adopting a sibling's orphans is the Kubernetes-specific
+        # extra a shutting-down pod also needs.
+        remaining = versions.recover_and_drain_version(version, s.pod_namespace)
         polls += 1
         logger.info(
             "drain poll",

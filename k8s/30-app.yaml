@@ -27,9 +27,9 @@ spec:
       # INVARIANT: drain + margin <= grace.
       #   drain 1470s + margin 30s = 1500s
       # The ceiling has to cover the longest backlog still running when the next
-      # version lands: 3 pods x 1 parent x 10 children x 10 steps x up to 10s,
+      # version lands: 3 pods x 1 parent x 15 children x 15 steps x up to 3s,
       # over the 6 concurrent slots the old pods still have (3 x worker
-      # concurrency 2), is about 8 minutes worst case. It is a safety ceiling,
+      # concurrency 2), is about 6 minutes worst case. It is a safety ceiling,
       # not the primary lever — the drain exits as soon as the version empties,
       # so a quiet deploy is still fast.
       terminationGracePeriodSeconds: 1500

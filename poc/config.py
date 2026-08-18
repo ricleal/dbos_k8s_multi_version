@@ -54,12 +54,23 @@ class Settings(BaseSettings):
     """Parent workflows this pod starts at launch. 0 makes it a pure worker."""
 
     worker_concurrency: int = 2
-    log_level: str = "INFO"
+    log_level: str = "DEBUG"
 
-    children: int = 10
-    steps_per_child: int = 10
+    children: int = 15
+    steps_per_child: int = 15
     step_min_sec: float = 1.0
-    step_max_sec: float = 10.0
+    step_max_sec: float = 3.0
+    """The backlog has to outlast a rollout, or there is nothing to demonstrate.
+
+    Under `maxUnavailable: 0` an old pod is not sent SIGTERM until the new pods
+    are Ready, which on a laptop cluster takes up to ~90s. A backlog shorter than
+    that finishes on its own before the drain ever starts, and every scenario
+    below degenerates into "nothing was in flight".
+
+    These values give each child 15 steps x ~2s = ~30s, and
+    3 pods x 15 children = 45 children over 6 concurrent slots (3 replicas x
+    worker_concurrency 2) = ~4 minutes of work — comfortably longer than a
+    rollout, short enough to watch."""
 
     dbos_system_database_url: PostgresDsn
 

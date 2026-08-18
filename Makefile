@@ -24,7 +24,7 @@ PSQL       := $(KUBECTL) exec -i postgres-0 -- psql -U dbos -d dbos_poc -c
 .PHONY: help
 help: ## Show this help
 	@grep -hE '^[a-zA-Z_-]+:.*?## ' $(MAKEFILE_LIST) | \
-	  awk 'BEGIN{FS=":.*?## "}{printf "  \033[36m%-10s\033[0m %s\n", $$1, $$2}'
+	  awk 'BEGIN{FS=":.*?## "}{printf "  \033[36m%-13s\033[0m %s\n", $$1, $$2}'
 	@echo ""
 	@echo "  version $(VERSION) (from pyproject.toml)   replicas $(REPLICAS)"
 
@@ -71,6 +71,37 @@ status: ## Pods by version, and the dbos schema's own view of the work
 .PHONY: logs
 logs: ## Follow every app pod's logs
 	$(KUBECTL) logs -l app=dbos-poc --all-containers --tail=50 -f --max-log-requests=10
+
+.PHONY: kill_version
+kill_version: ## Hard-kill every app container of VER, simulating node loss (VER=0.1.7)
+	@test -n "$(VER)" || { echo "usage: make kill_version VER=<application version>"; exit 1; }
+	@# Models losing the machine a pod ran on: the process dies at once, with no
+	@# SIGTERM and no drain, and the pod object goes with it. That is the only
+	@# way to leave a version with active work and no pods, which is what
+	@# cancel_stranded_versions exists to find.
+	@#
+	@# Neither obvious alternative produces it:
+	@#
+	@#   * `kubectl delete pod --force --grace-period=0` removes the pod OBJECT
+	@#     but never stops the process. The container keeps running, keeps
+	@#     dequeuing, and finishes the work — measured here, a version with zero
+	@#     pods ran 48 workflows to SUCCESS — so nothing is ever stranded. It is
+	@#     the same ghost hazard the teardown comment in `reset` warns about.
+	@#   * `kubectl exec -- kill -9 1` cannot work either: the kernel discards a
+	@#     SIGKILL sent to PID 1 from inside its own PID namespace.
+	@#
+	@# So kill it from the node, through the CRI, which is outside that namespace.
+	@# Only meaningful against pods that are already Terminating. On a live pod
+	@# the kubelet restarts the container under the same pod name — and therefore
+	@# the same executor id — which is the crash case DBOS's own startup recovery
+	@# already handles.
+	@for pod in $$($(KUBECTL) get pods -l app=dbos-poc,version=$(VER) -o name | cut -d/ -f2); do \
+	  ids=$$(docker exec $(NODE) crictl ps -q --label io.kubernetes.pod.name=$$pod); \
+	  if [ -n "$$ids" ]; then \
+	    docker exec $(NODE) crictl stop --timeout 0 $$ids >/dev/null && echo "killed $$pod"; \
+	  fi; \
+	done
+	@$(KUBECTL) wait --for=delete pod -l app=dbos-poc,version=$(VER) --timeout=90s
 
 .PHONY: dbos_reset
 dbos_reset: ## Drop the DBOS system database, running the CLI in a live app pod

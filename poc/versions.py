@@ -17,9 +17,17 @@ property we want — old work must not execute against new code. So nothing need
 to be built to *prevent* it. What must be built is the wait:
 :func:`drain_version` tells a retiring pod whether its version still owns work.
 
-The two are coupled, and the coupling runs one way: draining a version means
-finishing its work, and some of that work may be orphaned on pods that already
-died. So :func:`drain_version` calls :func:`recover_orphaned_workflows` first.
+The two are kept separate on purpose. :func:`drain_version` is pure DBOS — it
+counts what a version still owns and needs no Kubernetes API, no liveness oracle
+and nothing cluster-specific, which is the whole mechanism behind a safe rolling
+deployment. :func:`recover_orphaned_workflows` is the Kubernetes-specific half,
+because only the API server can say which executors are still alive.
+
+A pod shutting down wants both, since orphaned rows count as active and would
+keep the drain from ever reaching zero. :func:`recover_and_drain_version`
+composes them at the call site rather than hiding the dependency inside the
+drain. The composition runs one way: draining needs orphan recovery, not the
+other way round.
 """
 
 import threading
@@ -49,10 +57,6 @@ def _active(version: str | None = None) -> list:
         load_input=False,
         load_output=False,
     )
-
-
-def active_count(version: str) -> int:
-    return len(_active(version))
 
 
 def recover_orphaned_workflows(version: str, namespace: str) -> int:
@@ -131,16 +135,37 @@ def recover_orphaned_workflows(version: str, namespace: str) -> int:
     return len(handles)
 
 
-def drain_version(version: str, namespace: str) -> int:
+def drain_version(version: str) -> int:
     """Problem 2: how much work does this version still own? 0 means drained.
 
-    Adopts orphaned work first, so a pod draining on SIGTERM also picks up a
-    sibling that died mid-drain instead of waiting on rows nobody will ever run.
-    That is the coupling between the two problems, and it runs one way: draining
-    a version needs orphan recovery, not the other way round.
+    Deliberately pure DBOS. There is no Kubernetes here, no liveness oracle and
+    no orphan recovery: "does my version still own active work" is answered
+    entirely by ``dbos.workflow_status``. That is what makes a safe rolling
+    deployment cheap — the whole version half of this PoC is this one query plus
+    a grace period long enough to poll it. See *Rolling deployments with new
+    versions* in the README.
+
+    Takes no namespace for the same reason it takes no API client: it does not
+    need one. A caller draining on SIGTERM usually wants recovery as well, and
+    asks for it explicitly through :func:`recover_and_drain_version`.
+    """
+    return len(_active(version))
+
+
+def recover_and_drain_version(version: str, namespace: str) -> int:
+    """Adopt this version's orphaned work, then report what it still owns.
+
+    What a pod shutting down actually wants, and the only place the two problems
+    meet. Draining alone can stall: a sibling that died mid-drain leaves PENDING
+    rows nobody will ever run, and they count as active forever. Recovering first
+    hands them back to a live pod of this version — possibly this one.
+
+    Kept as a composition rather than folded into :func:`drain_version` so the
+    version machinery stays independently usable by anyone who already has
+    executor recovery from somewhere else.
     """
     recover_orphaned_workflows(version, namespace)
-    return active_count(version)
+    return drain_version(version)
 
 
 def cancel_stranded_versions(
