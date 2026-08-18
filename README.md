@@ -102,6 +102,74 @@ pod of any version may do it, and it is idempotent, so racing observers are fine
 The supervisor thread runs 1.1 and 1.2 every `sweep_interval_sec`, including
 while the pod is draining. `main.py` runs 2 on SIGTERM.
 
+## With and without Conductor
+
+[DBOS Conductor](https://docs.dbos.dev/production/conductor) is the paid control
+plane. It removes one half of this PoC and leaves the other half exactly where it
+was — which is why the code keeps the two apart.
+
+| Problem | Without Conductor | With Conductor |
+|---|---|---|
+| **1.1** work orphaned by a dead pod, siblings alive | Yours to build: `recover_orphaned_workflows` plus a liveness oracle | **Handled.** "When Conductor detects that an executor is unhealthy, it automatically signals another executor to recover its workflows." |
+| **2** retiring a version without losing its work | Yours to build: `drain_version` and a grace period long enough to poll it | **Still yours.** Conductor does not address it |
+| **1.2** a version with no pods left at all | Yours to build: `cancel_stranded_versions` | Still yours, but much rarer |
+
+### What Conductor lets you delete
+
+- **[poc/k8s.py](poc/k8s.py), entirely.** The pod-liveness oracle exists only
+  because DBOS keeps no registry of which executors are alive. Conductor *is*
+  that registry, and a better one — it knows an executor is unhealthy, rather
+  than inferring it from a pod object's absence.
+- **`recover_orphaned_workflows`,** and with it `recover_and_drain_version`. The
+  drain loop in `main.py` calls `drain_version` directly.
+- **The `pods: get/list` RBAC** in [k8s/20-rbac.yaml](k8s/20-rbac.yaml), and the
+  orphan half of the supervisor sweep.
+
+This is what the decoupling is for. `drain_version` takes no namespace, opens no
+API client and imports nothing from `poc.k8s`, so deleting the recovery half
+leaves it untouched.
+
+### What Conductor does not replace
+
+Draining. Conductor recovers an interrupted workflow onto another **healthy**
+executor, but healthy is not the same as *eligible*: recovery is version-scoped,
+so it can only ever hand v1's work to a v1 executor. If the last v1 pod is gone,
+Conductor has nowhere to put that work, exactly as before. Something still has to
+keep the old pods alive until their version is empty, and that is
+[Rolling deployments with new versions](#rolling-deployments-with-new-versions).
+
+One honest caveat: the Conductor documentation does not discuss application
+versions at all. The version scoping above is read out of the installed `dbos`
+2.29 source — `_recovery.py` filters on `GlobalParams.app_version` — which is the
+same code path the executor Conductor signals will run. It is an inference from
+the SDK, not a quote from the Conductor docs.
+
+### DBOS's own Kubernetes recommendation
+
+Worth knowing, because this PoC deliberately does something else.
+[Deploying With Kubernetes](https://docs.dbos.dev/production/hosting-with-kubernetes)
+recommends **a separate Deployment per active version**: point the Service
+selector at the latest version so new work goes only there, leave the old
+Deployments running to finish their workflows, and "once workflows for an old
+version complete, delete its Deployment" — automating that lifecycle with Flagger
+or Argo Rollouts.
+
+This PoC uses a single Deployment and an ordinary rolling update instead, for two
+reasons:
+
+- **There is no Service to repoint.** Work arrives through a DBOS queue, not
+  HTTP. The dequeue predicate is already version-scoped, so it does the job a
+  Service selector would have done, for free.
+- **Nothing has to remember to delete anything.** A retiring pod drains itself
+  and exits; the ReplicaSet is cleaned up by the Deployment. No external
+  controller, no leftover Deployments, no human in the loop.
+
+The trade-off is the ceiling. A Deployment per version can drain for as long as
+it likes; here the drain is bounded by `terminationGracePeriodSeconds`, and
+anything still unfinished when that expires is left to
+`cancel_stranded_versions`. If your workflows can run for hours, prefer DBOS's
+pattern — or raise the grace period, which is the same lever.
+
 ## Lifecycle
 
 ```
@@ -132,8 +200,8 @@ version empties, so a quiet deploy is still fast.
 This is the version half of the PoC, on its own. It needs no Kubernetes API
 access, no liveness oracle and no orphan recovery — only DBOS and a
 `terminationGracePeriodSeconds` long enough to wait out the backlog. If you
-already have executor recovery from elsewhere (DBOS Conductor, say), this section
-is the part that is still yours to build.
+already have executor recovery from elsewhere — [Conductor](#with-and-without-conductor),
+say — this section is the part that is still yours to build.
 
 ### Half of it is already free
 
