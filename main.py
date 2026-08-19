@@ -1,99 +1,146 @@
-import logging
-import os
-import random
+"""Entry point: launch DBOS, start the work, supervise the fleet, drain on SIGTERM.
+
+The model under test, from the DBOS "Upgrading Workflows" doc: on SIGTERM keep
+the DBOS runtime and queue pollers alive and poll until this pod's own
+application_version owns no active work; only then call destroy() and exit.
+Kubernetes holds the pod open for terminationGracePeriodSeconds while that runs.
+
+There is no HTTP server. Nothing routes traffic to these pods — work arrives
+through the queue — so the readiness probe was gating traffic that does not
+exist, and the work starts here rather than through a `/start` endpoint.
+"""
+
+import signal
+import sys
+import threading
 import time
+import types
 
-from dbos import DBOS, DBOSConfig, Queue, WorkflowHandle
-from dotenv import load_dotenv
-from faker import Faker
+from dbos import DBOS
 
-# Load values from .env into environment variables
-load_dotenv()
+from poc import logs, versions, workflows
+from poc.config import Settings
 
-logger = logging.getLogger(__name__)
+logger = logs.get_logger("poc")
 
+EXIT_CLEAN = 0
+EXIT_TRUNCATED = 75
 
-fake = Faker()
-Faker.seed(123)
-random.seed(3)
-
-queue = Queue("my_queue", concurrency=4, worker_concurrency=2)
+_sigterm = threading.Event()
+_sigterm_at: float = 0.0
 
 
-config: DBOSConfig = {
-    "name": "dbos-k8s-multi-version",
-    "system_database_url": os.environ.get(
-        "DBOS_SYSTEM_DATABASE_URL",
-        "postgresql://trustle:trustle@localhost:5432/test?sslmode=disable",
-    ),
-    "log_level": "DEBUG",
-}
-DBOS(config=config)
+def _elapsed() -> float:
+    return time.monotonic() - _sigterm_at
 
 
-def compute_application_version() -> str:
-    """compute the application version from environment variables or default to a human readable timestamp"""
-    t = time.localtime()
-    timestamp = time.strftime("%Y%m%d%H%M%S", t)
-    return os.environ.get("APPLICATION_VERSION", timestamp)
-
-
-@DBOS.step()
-def fetch_url(url: str) -> float:
-    delay = random.uniform(
-        float(os.environ.get("MIN_DELAY", 0.1)), float(os.environ.get("MAX_DELAY", 5.0))
+def _on_sigterm(signum: int, _frame: types.FrameType | None) -> None:
+    global _sigterm_at
+    if _sigterm.is_set():
+        return
+    _sigterm_at = time.monotonic()
+    _sigterm.set()
+    logger.info(
+        "SIGTERM received; starting drain",
+        signum=signal.Signals(signum).name,
+        elapsed=0.0,
     )
-    time.sleep(delay)
-    DBOS.logger.debug(
-        "Fetched URL: %s, delay: %.2f seconds (version=%s)",
-        url,
-        delay,
-        DBOS.application_version,
-    )
-    return delay
 
 
-@DBOS.workflow()
-def workflow_instance(instance_id: int) -> tuple[int, float]:
-    DBOS.logger.info(
-        "Starting workflow instance %d (version=%s)",
-        instance_id,
-        DBOS.application_version,
+def drain_to_empty(s: Settings, stop_supervisor: threading.Event) -> int:
+    """Keep the pollers alive until this version owns no active work."""
+    deadline = _sigterm_at + s.drain_budget_sec
+    version = DBOS.application_version
+    logger.info(
+        "draining to empty",
+        elapsed=round(_elapsed(), 1),
+        budget_sec=s.drain_budget_sec,
+        grace_sec=s.grace_period_sec,
+        drain_margin_sec=s.drain_margin_sec,
     )
-    total_delay = 0.0
+
+    polls = 0
     while True:
-        url = fake.url()
-        delay = fetch_url(url)
-        total_delay += delay
-        if total_delay > 3600.0:
-            DBOS.logger.warning(
-                "Workflow instance %d exceeded 1 hour total delay (version=%s)",
-                instance_id,
-                DBOS.application_version,
-            )
-            break
-
-    return instance_id, total_delay
-
-
-def main():
-    DBOS.launch()
-    DBOS.application_version = compute_application_version()
-
-    n_workflows = int(os.environ.get("N_WORKFLOWS", 10))
-    delay_between_workflows = float(os.environ.get("DELAY_BETWEEN_WORKFLOWS", 60))
-
-    logger.info("Starting Workflows (version=%s)", DBOS.application_version)
-
-    task_handles = []
-    for i in range(n_workflows):
-        handle: WorkflowHandle = queue.enqueue(workflow_instance, i)
-        task_handles.append(handle)
+        # Recovery is composed in here, not inside drain_version: the drain is
+        # pure DBOS, and adopting a sibling's orphans is the Kubernetes-specific
+        # extra a shutting-down pod also needs.
+        remaining = versions.recover_and_drain_version(version, s.pod_namespace)
+        polls += 1
         logger.info(
-            "Enqueued workflow instance %d (version=%s)", i, DBOS.application_version
+            "drain poll",
+            elapsed=round(_elapsed(), 1),
+            poll_number=polls,
+            remaining_active=remaining,
+            application_version=version,
         )
-        time.sleep(delay_between_workflows)
+        if remaining == 0 or time.monotonic() >= deadline:
+            break
+        time.sleep(
+            min(s.drain_poll_interval_sec, max(0.0, deadline - time.monotonic()))
+        )
+
+    truncated = remaining != 0
+    # A truncated drain must be distinguishable from a clean one. The database is
+    # the durable record: rows left active on a retired version mean the drain did
+    # not finish. Those rows are precisely what cancel_stranded_versions will find
+    # once this pod is gone and no other pod of this version remains.
+    logger.info(
+        "DRAIN_RESULT",
+        executor=DBOS.executor_id,
+        version=version,
+        outcome="truncated" if truncated else "clean",
+        drain_seconds=round(_elapsed(), 1),
+        budget_sec=s.drain_budget_sec,
+        remaining_active=remaining,
+    )
+
+    # Stop sweeping before destroy(): the loop reads DBOS.application_version,
+    # which destroy() resets.
+    stop_supervisor.set()
+
+    DBOS.destroy()
+    logger.info("destroy() returned; exiting", elapsed=round(_elapsed(), 1))
+    return EXIT_TRUNCATED if truncated else EXIT_CLEAN
+
+
+def main() -> int:
+    s = Settings()
+
+    logs.configure(s.log_level)
+    workflows.init_dbos(s)
+    DBOS.launch()
+    # After launch, never at import time: a database-backed queue is registered
+    # through the launched singleton's system database.
+    workflows.register_queues()
+
+    # Installed before any work starts, so a SIGTERM arriving during startup is
+    # still drained rather than killing the process outright.
+    signal.signal(signal.SIGTERM, _on_sigterm)
+    signal.signal(signal.SIGINT, _on_sigterm)
+
+    stop_supervisor = threading.Event()
+    versions.start_supervisor(s, stop_supervisor)
+
+    latest = DBOS.get_latest_application_version()["version_name"]
+    is_latest = latest == DBOS.application_version
+    logger.info(
+        "launched",
+        latest_version=latest,
+        is_latest=is_latest,
+        drain_budget_sec=s.drain_budget_sec,
+    )
+
+    # Only the current version injects new work. A pod of a retired version that
+    # restarts mid-drain is here to finish the backlog, not to add to it.
+    if is_latest:
+        for seq in range(s.parents_on_launch):
+            logger.info(
+                "started parent workflow", workflow_id=workflows.start_parent(seq)
+            )
+
+    _sigterm.wait()
+    return drain_to_empty(s, stop_supervisor)
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

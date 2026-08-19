@@ -1,0 +1,32 @@
+# Liveness comes from the API server, so the app needs to read pods — and only
+# read them. The one write this PoC makes to stranded work is a database cancel,
+# not a Kubernetes action, so nothing here grants mutation.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: dbos-poc
+  namespace: dbos-poc
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: dbos-poc-pod-reader
+  namespace: dbos-poc
+rules:
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "list"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: dbos-poc-pod-reader
+  namespace: dbos-poc
+subjects:
+  - kind: ServiceAccount
+    name: dbos-poc
+    namespace: dbos-poc
+roleRef:
+  kind: Role
+  name: dbos-poc-pod-reader
+  apiGroup: rbac.authorization.k8s.io

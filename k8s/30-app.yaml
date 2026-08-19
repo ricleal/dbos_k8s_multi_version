@@ -1,0 +1,105 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: dbos-poc
+  namespace: dbos-poc
+spec:
+  replicas: __REPLICAS__
+  selector:
+    matchLabels:
+      app: dbos-poc
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      # All old pods must drain simultaneously. Under maxUnavailable: 1 the first
+      # old pod waits on work owned by old pods that are still running normally
+      # and still creating more, and the rollout deadlocks.
+      maxSurge: 100%
+      maxUnavailable: 0
+  template:
+    metadata:
+      labels:
+        app: dbos-poc
+        # Read by poc/k8s.py: this is how the API server answers "which executors
+        # of version X are alive". It must stay in sync with the image tag.
+        version: "__VERSION__"
+    spec:
+      # INVARIANT: drain + margin <= grace.
+      #   drain 1470s + margin 30s = 1500s
+      # The ceiling has to cover the longest backlog still running when the next
+      # version lands: 3 pods x 1 parent x 15 children x 15 steps x up to 3s,
+      # over the 6 concurrent slots the old pods still have (3 x worker
+      # concurrency 2), is about 6 minutes worst case. It is a safety ceiling,
+      # not the primary lever — the drain exits as soon as the version empties,
+      # so a quiet deploy is still fast.
+      terminationGracePeriodSeconds: 1500
+      serviceAccountName: dbos-poc
+      initContainers:
+        - name: wait-for-postgres
+          image: postgres:17-alpine
+          env:
+            - name: POSTGRES_USER
+              valueFrom:
+                secretKeyRef: { name: dbos-poc-db, key: POSTGRES_USER }
+            - name: POSTGRES_DB
+              valueFrom:
+                secretKeyRef: { name: dbos-poc-db, key: POSTGRES_DB }
+          command:
+            - sh
+            - -c
+            - until pg_isready -h postgres -U "$POSTGRES_USER" -d "$POSTGRES_DB"; do sleep 1; done
+      containers:
+        - name: app
+          image: __IMAGE__
+          imagePullPolicy: Never
+          # No preStop hook. It existed to delay SIGTERM while a Service dropped
+          # this pod from its endpoints; there is no Service, so it only ever
+          # delayed the drain — and a hook outlasting the grace period gives the
+          # kubelet a shutdown it cannot complete on time.
+          volumeMounts:
+            # The database URL arrives as a file, not an environment variable:
+            # k8s/05-secret.yaml projected at /app/.env, which is exactly where
+            # pydantic-settings looks (`env_file=".env"` in poc/config.py, and
+            # the image's WORKDIR is /app). subPath mounts the single file
+            # without shadowing the rest of /app.
+            - name: dotenv
+              mountPath: /app/.env
+              subPath: .env
+              readOnly: true
+          env:
+            # DBOS derives executor_id from DBOS__VMID, falling back to the shared
+            # literal "local". An executor id identifies one running process, so
+            # every replica needs its own: with a shared id, a starting pod's
+            # recovery claims PENDING work that a live sibling is still running.
+            # The app does not invent an id; it feeds DBOS's own variable.
+            - name: DBOS__VMID
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            # The same name again, under the app's own setting, so the pod can
+            # recognise its own rows and derive stable workflow ids.
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: POD_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+          # No probes. Nothing routes traffic here — work arrives through the
+          # queue — so there is no readiness to gate, and a liveness probe would
+          # risk restarting a pod in the middle of a drain.
+          resources:
+            requests:
+              cpu: 100m
+              memory: 256Mi
+      volumes:
+        - name: dotenv
+          secret:
+            secretName: dbos-poc-db
+            defaultMode: 0440
+            # Only the dotenv key. Without this the POSTGRES_* fields would be
+            # projected too, and the app has no business reading them.
+            items:
+              - key: .env
+                path: .env
