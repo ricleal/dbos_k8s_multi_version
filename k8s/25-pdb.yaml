@@ -1,0 +1,23 @@
+# Bounds *voluntary* disruption: `kubectl drain`, a cluster-autoscaler scale-down,
+# a node-pool upgrade. Those go through the eviction API, which a PodDisruptionBudget
+# can refuse; and each eviction then waits out the pod's grace period while it drains.
+# Without this, draining a node that hosts every replica retires the whole version at
+# once, and the work it owned has no live pod of its version left to finish it — the
+# stranded-version case, arrived at on purpose rather than by accident.
+#
+# It does NOT govern a rolling update. A Deployment rollout deletes pods directly
+# rather than evicting them, so maxSurge/maxUnavailable in k8s/30-app.yaml is what
+# shapes a deploy. The two knobs look alike and cover disjoint cases.
+#
+# maxUnavailable rather than minAvailable so the budget survives a replica-count
+# change: "one at a time" stays true whether there are 3 replicas or 30.
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: dbos-poc
+  namespace: dbos-poc
+spec:
+  maxUnavailable: 1
+  selector:
+    matchLabels:
+      app: dbos-poc

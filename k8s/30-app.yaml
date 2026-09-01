@@ -25,14 +25,20 @@ spec:
         version: "__VERSION__"
     spec:
       # INVARIANT: drain + margin <= grace.
-      #   drain 1470s + margin 30s = 1500s
-      # The ceiling has to cover the longest backlog still running when the next
-      # version lands: 3 pods x 1 parent x 15 children x 15 steps x up to 3s,
-      # over the 6 concurrent slots the old pods still have (3 x worker
-      # concurrency 2), is about 6 minutes worst case. It is a safety ceiling,
-      # not the primary lever — the drain exits as soon as the version empties,
-      # so a quiet deploy is still fast.
-      terminationGracePeriodSeconds: 1500
+      #   drain 100s + margin 20s = 120s
+      # Kept deliberately short, because a grace period is a promise the platform
+      # may not keep. `kubectl drain` waits it out in full; cluster-autoscaler
+      # force-deletes after --max-graceful-termination-sec (10 minutes by
+      # default); spot preemption gives 30s-2min. A 25-minute grace period reads
+      # as safety and is really an unbounded hold on every node operation, then
+      # gets truncated anyway.
+      #
+      # So the backlog is sized to fit the ceiling, not the other way round:
+      # 3 pods x 1 parent x 10 children x 8 steps x up to 3s over 6 concurrent
+      # slots (3 x worker_concurrency 2) is ~80s of work, and only the part still
+      # unfinished at SIGTERM has to drain. The drain exits the moment the version
+      # empties, so this is a ceiling, never the expected duration.
+      terminationGracePeriodSeconds: 120
       serviceAccountName: dbos-poc
       initContainers:
         - name: wait-for-postgres

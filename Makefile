@@ -35,6 +35,7 @@ infra: ## Create the namespace, Secret, Postgres and the RBAC the app needs
 	kubectl apply -f k8s/05-secret.yaml
 	kubectl apply -f k8s/10-postgres.yaml
 	kubectl apply -f k8s/20-rbac.yaml
+	kubectl apply -f k8s/25-pdb.yaml
 	$(KUBECTL) rollout status statefulset/postgres --timeout=180s
 
 .PHONY: build

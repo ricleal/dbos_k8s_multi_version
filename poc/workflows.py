@@ -93,8 +93,29 @@ def child_workflow(child: int, steps: int) -> float:
 
 
 @DBOS.workflow()
-def parent_workflow(children: int, steps_per_child: int) -> float:
-    """Enqueues the children and waits for them.
+def parent_workflow(children: int, steps_per_child: int) -> list[str]:
+    """Enqueues the children and returns. It does **not** wait for them.
+
+    Waiting was the single worst thing this workflow could do, for three reasons:
+
+    1. **It made the drain as long as the whole backlog.** A parent blocked on
+       ``get_result()`` stays PENDING until the last child finishes, so a version
+       could not retire until every child of every parent was done — which is the
+       unbounded hold that makes a node drain or an autoscaler scale-down wait.
+       Fire-and-forget means the parent is done in milliseconds and the drain
+       waits only on children actually in flight.
+    2. **It burned a slot doing nothing.** The parent is started off-queue so it
+       does not consume ``worker_concurrency``, but it still pinned a thread and a
+       database connection for minutes to poll for results nobody read.
+    3. **It was the row most likely to be orphaned.** The longer a workflow stays
+       PENDING, the better its chances of being the one holding a slot when its
+       pod dies. A parent that completes immediately is never orphaned, so pod
+       loss can only strand children — which are short, and bounded.
+
+    Returning the child ids rather than a total is the honest signature: the
+    result is a receipt for work started, not an answer. Completion is a question
+    for ``dbos.workflow_status``, which is where every other observer in this PoC
+    already looks.
 
     The children are stamped with the version of the pod that enqueued them, not
     the latest version, so they stay the property of this version's pods.
@@ -108,15 +129,16 @@ def parent_workflow(children: int, steps_per_child: int) -> float:
     workflow from there.
     """
     logger.info("parent_workflow: enqueuing children", children=children)
-    handles = [
-        DBOS.enqueue_workflow(QUEUE_NAME, child_workflow, i, steps_per_child)
+    return [
+        DBOS.enqueue_workflow(
+            QUEUE_NAME, child_workflow, i, steps_per_child
+        ).workflow_id
         for i in range(children)
     ]
-    return sum(h.get_result() for h in handles)
 
 
 def start_parent(seq: int = 0) -> str:
-    """Start the parent off-queue so it does not hold a worker slot while it waits.
+    """Start the parent off-queue so it does not consume a worker slot.
 
     Settings are resolved here, outside the workflow, and passed in.
 

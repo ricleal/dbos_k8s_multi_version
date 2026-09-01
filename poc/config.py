@@ -28,10 +28,16 @@ def project_version() -> str:
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")
 
-    grace_period_sec: int = 1500
-    """Mirrors the pod's terminationGracePeriodSeconds."""
+    grace_period_sec: int = 120
+    """Mirrors the pod's terminationGracePeriodSeconds.
 
-    drain_margin_sec: int = 30
+    Short on purpose. A long grace period is not free safety: every voluntary
+    eviction — node drain, autoscaler scale-down, node-pool upgrade — waits it
+    out, and the platform caps it anyway (cluster-autoscaler force-deletes after
+    10 minutes by default; spot preemption gives 30s-2min). Size the backlog to
+    fit this, rather than raising this to fit the backlog."""
+
+    drain_margin_sec: int = 20
     """Headroom left for destroy() and process exit after the drain loop."""
 
     drain_poll_interval_sec: float = 5.0
@@ -56,21 +62,30 @@ class Settings(BaseSettings):
     worker_concurrency: int = 2
     log_level: str = "DEBUG"
 
-    children: int = 15
-    steps_per_child: int = 15
+    children: int = 10
+    steps_per_child: int = 8
     step_min_sec: float = 1.0
     step_max_sec: float = 3.0
-    """The backlog has to outlast a rollout, or there is nothing to demonstrate.
+    """Sized between two constraints, which pull in opposite directions.
 
-    Under `maxUnavailable: 0` an old pod is not sent SIGTERM until the new pods
-    are Ready, which on a laptop cluster takes up to ~90s. A backlog shorter than
-    that finishes on its own before the drain ever starts, and every scenario
-    below degenerates into "nothing was in flight".
+    Lower bound: the backlog has to outlast a rollout. Under `maxUnavailable: 0`
+    an old pod is not sent SIGTERM until the new pods are Ready — ~15s here, as
+    there are no probes to satisfy. A backlog shorter than that finishes on its
+    own before the drain starts, and every scenario degenerates into "nothing was
+    in flight".
 
-    These values give each child 15 steps x ~2s = ~30s, and
-    3 pods x 15 children = 45 children over 6 concurrent slots (3 replicas x
-    worker_concurrency 2) = ~4 minutes of work — comfortably longer than a
-    rollout, short enough to watch."""
+    Upper bound: whatever is *still unfinished at SIGTERM* must drain inside
+    `drain_budget_sec`. Exceed it and the drain reports `truncated` and the work
+    strands on a retired version.
+
+    These give each child 8 steps x ~2s = ~16s, and 3 pods x 10 children = 30
+    children over 6 concurrent slots (3 replicas x worker_concurrency 2) = ~80s
+    of work. A rollout ~15-30s in leaves ~50-65s to drain, inside the 100s
+    budget, with the whole run short enough to watch.
+
+    The real lever on drain time is child *duration*, not count: the drain can
+    never be shorter than the longest child still running. Bounding that is what
+    lets the grace period stay at 120s."""
 
     dbos_system_database_url: PostgresDsn
 
