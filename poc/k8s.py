@@ -13,9 +13,11 @@ restarts keeps its pod — and therefore its name, and therefore its
 ``executor_id`` — so its rows stay untouched and DBOS's own startup recovery
 reclaims them when it relaunches.
 
-Everything here is read-only. The one write this PoC performs on stranded work
-is a database cancel, not a Kubernetes action, so the ServiceAccount needs no
-more than ``get`` and ``list`` on pods.
+Reading pods answers "who is alive". Deployments answer a second question: which
+versions still have a fleet at all. Every version runs in its own Deployment, so
+one object deletion retires a whole version, and :func:`delete_deployment` is the
+only write in this module. The ServiceAccount therefore needs ``get`` and
+``list`` on pods, and ``get``, ``list`` and ``delete`` on deployments.
 """
 
 from kubernetes import client, config
@@ -35,6 +37,8 @@ VERSION_LABEL = "version"
 _DEAD_PHASES = frozenset({"Succeeded", "Failed"})
 
 _api: client.CoreV1Api | None = None
+_apps_api: client.AppsV1Api | None = None
+_policy_api: client.PolicyV1Api | None = None
 _unavailable = False
 
 
@@ -59,6 +63,16 @@ def _core() -> client.CoreV1Api | None:
             return None
         _api = client.CoreV1Api()
     return _api
+
+
+def _apps() -> client.AppsV1Api | None:
+    """The Deployment client, or None when there is no cluster. See :func:`_core`."""
+    global _apps_api
+    if _core() is None:
+        return None
+    if _apps_api is None:
+        _apps_api = client.AppsV1Api()
+    return _apps_api
 
 
 def live_pods_by_version(namespace: str) -> dict[str, set[str]] | None:
@@ -90,3 +104,72 @@ def live_pods_by_version(namespace: str) -> dict[str, set[str]] | None:
         # into DBOS__VMID, which is where DBOS reads executor_id from.
         live.setdefault(version, set()).add(pod.metadata.name)
     return live
+
+
+def deployments_by_version(namespace: str) -> dict[str, str] | None:
+    """Version -> Deployment name, for every app Deployment in the namespace.
+
+    Returns None when the API cannot be reached, for the same reason
+    :func:`live_pods_by_version` does: unknown must not be read as none, or a
+    caller would retire versions it simply failed to see.
+    """
+    apps = _apps()
+    if apps is None:
+        return None
+
+    try:
+        found = apps.list_namespaced_deployment(namespace, label_selector=APP_LABEL)
+    except Exception:
+        logger.exception("listing deployments failed; treating the result as unknown")
+        return None
+
+    out: dict[str, str] = {}
+    for deployment in found.items:
+        version = (deployment.metadata.labels or {}).get(VERSION_LABEL)
+        if version is not None:
+            out[version] = deployment.metadata.name
+    return out
+
+
+def delete_deployment(namespace: str, name: str) -> bool:
+    """Delete one Deployment. Returns whether this call was the one that did it.
+
+    The only write in this module. A 404 means another pod deleted it first,
+    which is the expected outcome of three replicas sweeping together, so it is
+    not an error and returns False rather than raising.
+    """
+    apps = _apps()
+    if apps is None:
+        return False
+
+    try:
+        apps.delete_namespaced_deployment(name=name, namespace=namespace)
+    except client.ApiException as exc:
+        if exc.status == 404:
+            return False
+        raise
+    return True
+
+
+def delete_pdb(namespace: str, name: str) -> bool:
+    """Delete one PodDisruptionBudget. Returns whether this call deleted it.
+
+    Budgets are per version and share the Deployment's name, but a Deployment
+    does not own its budget, so deleting the Deployment leaves it behind.
+    Retirement deletes both. A 404 means another pod was first.
+    """
+    global _policy_api
+    if _core() is None:
+        return False
+    if _policy_api is None:
+        _policy_api = client.PolicyV1Api()
+
+    try:
+        _policy_api.delete_namespaced_pod_disruption_budget(
+            name=name, namespace=namespace
+        )
+    except client.ApiException as exc:
+        if exc.status == 404:
+            return False
+        raise
+    return True

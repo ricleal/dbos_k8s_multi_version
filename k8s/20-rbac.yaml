@@ -1,6 +1,16 @@
-# Liveness comes from the API server, so the app needs to read pods — and only
-# read them. The one write this PoC makes to stranded work is a database cancel,
-# not a Kubernetes action, so nothing here grants mutation.
+# Two reads and one write.
+#
+# Reading pods is the liveness oracle: DBOS keeps no register of live executors,
+# so the API server answers "does the pod that claimed this row still exist".
+#
+# Reading deployments answers a different question — which versions still have a
+# fleet. Deleting one retires a whole version, and it is the only mutation this
+# app makes to the cluster. It is needed because a Deployment always restarts a
+# container that exits, so an old version cannot retire itself by exiting: the
+# pods of the latest version delete its Deployment once it owns no work. See
+# retire_drained_versions in poc/versions.py.
+#
+# Cancelling stranded work is still a database write, not a Kubernetes one.
 apiVersion: v1
 kind: ServiceAccount
 metadata:
@@ -10,17 +20,27 @@ metadata:
 apiVersion: rbac.authorization.k8s.io/v1
 kind: Role
 metadata:
-  name: dbos-poc-pod-reader
+  name: dbos-poc-fleet
   namespace: dbos-poc
 rules:
   - apiGroups: [""]
     resources: ["pods"]
     verbs: ["get", "list"]
+  - apiGroups: ["apps"]
+    resources: ["deployments"]
+    # No create and no update. This app never brings a version up — that is the
+    # deploy's job — it only removes one that has finished.
+    verbs: ["get", "list", "delete"]
+  - apiGroups: ["policy"]
+    resources: ["poddisruptionbudgets"]
+    # Each version has its own budget, named after its Deployment but not owned
+    # by it, so retirement has to delete it explicitly or it would accumulate.
+    verbs: ["get", "list", "delete"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding
 metadata:
-  name: dbos-poc-pod-reader
+  name: dbos-poc-fleet
   namespace: dbos-poc
 subjects:
   - kind: ServiceAccount
@@ -28,5 +48,5 @@ subjects:
     namespace: dbos-poc
 roleRef:
   kind: Role
-  name: dbos-poc-pod-reader
+  name: dbos-poc-fleet
   apiGroup: rbac.authorization.k8s.io

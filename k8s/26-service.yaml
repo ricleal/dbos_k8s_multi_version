@@ -1,0 +1,27 @@
+# The version cutover, in one field.
+#
+# The selector carries `version`, so this Service resolves to the pods of one
+# application version only. A deploy rewrites it to the new version, and from
+# that instant the old pods are out of the endpoint list and no request can
+# reach them. Their queue pollers are untouched: they keep working through the
+# backlog they already own.
+#
+# That separation is the point. Losing traffic and losing the right to finish
+# your work are different events, and only the first happens at deploy time.
+#
+# A readiness probe cannot do this. Readiness removes a pod from the Service it
+# already belongs to, which is a statement about one pod's health, not about
+# which version should receive new requests.
+apiVersion: v1
+kind: Service
+metadata:
+  name: dbos-poc
+  namespace: dbos-poc
+spec:
+  selector:
+    app: dbos-poc
+    version: "__VERSION__"
+  ports:
+    - name: http
+      port: 80
+      targetPort: http

@@ -1,21 +1,36 @@
+# One Deployment for each application version.
+#
+# The name carries the version, so a deploy CREATES a fleet rather than replacing
+# one. Nothing rolls: the old Deployment is untouched and its pods stay Running.
+# They lose their API traffic when k8s/26-service.yaml moves its selector, and
+# they keep the queue pollers that let them finish the backlog they already own —
+# for an hour, if that is how long it takes.
+#
+# There is no rollingUpdate strategy here for the same reason. A rolling update
+# is a same-Deployment concept, and this design never has two versions inside one
+# Deployment. maxSurge and maxUnavailable have nothing to govern.
+#
+# retire_drained_versions (poc/versions.py) deletes this object once its version
+# owns no active work. That deletion is what finally sends SIGTERM to these pods.
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: dbos-poc
+  name: __DEPLOY_NAME__
   namespace: dbos-poc
+  labels:
+    app: dbos-poc
+    # Read by poc/k8s.py to answer "which versions still have a fleet". It is on
+    # the Deployment as well as the pods, so a version is identifiable even
+    # before its pods exist.
+    version: "__VERSION__"
 spec:
   replicas: __REPLICAS__
   selector:
     matchLabels:
       app: dbos-poc
-  strategy:
-    type: RollingUpdate
-    rollingUpdate:
-      # All old pods must drain simultaneously. Under maxUnavailable: 1 the first
-      # old pod waits on work owned by old pods that are still running normally
-      # and still creating more, and the rollout deadlocks.
-      maxSurge: 100%
-      maxUnavailable: 0
+      # Includes the version, so this Deployment only ever owns its own pods.
+      # Without it, every Deployment would claim every app pod.
+      version: "__VERSION__"
   template:
     metadata:
       labels:
@@ -24,20 +39,19 @@ spec:
         # of version X are alive". It must stay in sync with the image tag.
         version: "__VERSION__"
     spec:
-      # INVARIANT: drain + margin <= grace.
-      #   drain 100s + margin 20s = 120s
-      # Kept deliberately short, because a grace period is a promise the platform
-      # may not keep. `kubectl drain` waits it out in full; cluster-autoscaler
-      # force-deletes after --max-graceful-termination-sec (10 minutes by
-      # default); spot preemption gives 30s-2min. A 25-minute grace period reads
-      # as safety and is really an unbounded hold on every node operation, then
-      # gets truncated anyway.
+      # The ceiling for an UNPLANNED stop only — a node drain, an eviction, or the
+      # retirement delete once this version is already drained. A planned
+      # retirement never runs out of time here, because nothing sends SIGTERM
+      # until the work is finished.
       #
-      # So the backlog is sized to fit the ceiling, not the other way round:
-      # 3 pods x 1 parent x 10 children x 8 steps x up to 3s over 6 concurrent
-      # slots (3 x worker_concurrency 2) is ~80s of work, and only the part still
-      # unfinished at SIGTERM has to drain. The drain exits the moment the version
-      # empties, so this is a ceiling, never the expected duration.
+      # INVARIANT: drain + margin <= grace, which the app checks at startup.
+      #   drain 100s + margin 20s = 120s
+      #
+      # Kept short deliberately. A grace period is a promise the platform may not
+      # keep: `kubectl drain` waits it out in full, cluster-autoscaler
+      # force-deletes after --max-graceful-termination-sec (10 minutes by
+      # default), and spot preemption gives 30s-2min. Long work is handled by
+      # outliving the rollout, not by a longer grace period.
       terminationGracePeriodSeconds: 120
       serviceAccountName: dbos-poc
       initContainers:
@@ -58,10 +72,16 @@ spec:
         - name: app
           image: __IMAGE__
           imagePullPolicy: Never
-          # No preStop hook. It existed to delay SIGTERM while a Service dropped
-          # this pod from its endpoints; there is no Service, so it only ever
-          # delayed the drain — and a hook outlasting the grace period gives the
-          # kubelet a shutdown it cannot complete on time.
+          ports:
+            # Named, because k8s/26-service.yaml targets the name rather than the
+            # number. The port can move without touching the Service.
+            - name: http
+              containerPort: 8080
+          # No preStop hook. Its usual job is to delay SIGTERM while a Service
+          # drops the pod from its endpoints. Here the Service selector moves to
+          # the new version instead, long before SIGTERM, so a hook would only
+          # delay the drain — and one that outlasts the grace period gives the
+          # kubelet a shutdown it cannot finish on time.
           volumeMounts:
             # The database URL arrives as a file, not an environment variable:
             # k8s/05-secret.yaml projected at /app/.env, which is exactly where
@@ -92,9 +112,14 @@ spec:
               valueFrom:
                 fieldRef:
                   fieldPath: metadata.namespace
-          # No probes. Nothing routes traffic here — work arrives through the
-          # queue — so there is no readiness to gate, and a liveness probe would
-          # risk restarting a pod in the middle of a drain.
+          # No readiness probe, even though there is now a Service. Readiness
+          # answers "is this pod well enough for its own Service", and the
+          # version cutover is a different question, answered by the Service
+          # selector. A readiness probe here would also be actively wrong: a pod
+          # finishing an old version's backlog is healthy, and marking it
+          # NotReady would say otherwise while changing nothing about routing.
+          #
+          # No liveness probe either — it would risk restarting a pod mid-drain.
           resources:
             requests:
               cpu: 100m
@@ -109,3 +134,31 @@ spec:
             items:
               - key: .env
                 path: .env
+---
+# One budget for each version's fleet, not one for all of them.
+#
+# It bounds *voluntary* disruption: node drains, autoscaler scale-downs and
+# upgrades go through the eviction API, which a budget can refuse. Without it,
+# draining a node that hosts every replica of a version removes that whole fleet
+# at once, and its work has no pod of its version left to finish it.
+#
+# The selector carries the version for a reason. A budget matching both fleets at
+# once would compute its allowance across two Deployments, so a disruption to the
+# new version would consume the old version's protection.
+#
+# retire_drained_versions deletes this alongside the Deployment. Nothing else
+# would: it is a separate object, and a Deployment does not own it.
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: __DEPLOY_NAME__
+  namespace: dbos-poc
+  labels:
+    app: dbos-poc
+    version: "__VERSION__"
+spec:
+  maxUnavailable: 1
+  selector:
+    matchLabels:
+      app: dbos-poc
+      version: "__VERSION__"

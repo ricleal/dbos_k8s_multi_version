@@ -56,6 +56,9 @@ class Settings(BaseSettings):
     pod_namespace: str = "dbos-poc"
     """Namespace to look for sibling pods in. From POD_NAMESPACE."""
 
+    http_port: int = 8080
+    """Port the API listens on. The Service targets it by name, not by number."""
+
     parents_on_launch: int = 1
     """Parent workflows this pod starts at launch. 0 makes it a pure worker."""
 

@@ -152,3 +152,18 @@ def start_parent(seq: int = 0) -> str:
         return DBOS.start_workflow(
             parent_workflow, s.children, s.steps_per_child
         ).workflow_id
+
+
+def start_parent_adhoc() -> str:
+    """Start a parent for an API request, with a generated workflow id.
+
+    Deliberately not idempotent, unlike :func:`start_parent`. A launch-time
+    parent must not be duplicated when a container restarts, so its id is
+    derived and acts as a deduplication key. An API request is the opposite: two
+    calls are two instructions, and giving them a shared derived id would make
+    the second one silently return the first one's workflow.
+    """
+    s = settings()
+    return DBOS.start_workflow(
+        parent_workflow, s.children, s.steps_per_child
+    ).workflow_id

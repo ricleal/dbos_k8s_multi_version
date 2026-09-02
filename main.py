@@ -5,9 +5,16 @@ the DBOS runtime and queue pollers alive and poll until this pod's own
 application_version owns no active work; only then call destroy() and exit.
 Kubernetes holds the pod open for terminationGracePeriodSeconds while that runs.
 
-There is no HTTP server. Nothing routes traffic to these pods — work arrives
-through the queue — so the readiness probe was gating traffic that does not
-exist, and the work starts here rather than through a `/start` endpoint.
+Each version runs in its own Deployment, so SIGTERM does not arrive at the start
+of a version's retirement. It arrives at the end. An old version loses its API
+traffic when the Service selector moves to the new version, then keeps working
+for as long as its backlog takes, with no grace period counting against it. Only
+once it owns nothing does the latest version delete its Deployment, and only
+then does SIGTERM reach these pods — to a drain that finds nothing left.
+
+The drain below therefore covers two cases: that final tidy exit, and the
+unplanned ones, where a node drain or an eviction removes a pod that still has
+work.
 """
 
 import signal
@@ -18,7 +25,7 @@ import types
 
 from dbos import DBOS
 
-from poc import logs, versions, workflows
+from poc import logs, server, versions, workflows
 from poc.config import Settings
 
 logger = logs.get_logger("poc")
@@ -120,6 +127,11 @@ def main() -> int:
 
     stop_supervisor = threading.Event()
     versions.start_supervisor(s, stop_supervisor)
+
+    # Served by every pod, old and new. A Service selector decides which pods
+    # receive requests, so an old version keeps a working API that simply has no
+    # traffic — see poc/server.py.
+    server.serve(s)
 
     latest = DBOS.get_latest_application_version()["version_name"]
     is_latest = latest == DBOS.application_version

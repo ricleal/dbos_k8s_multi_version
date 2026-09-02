@@ -14,9 +14,19 @@ IMAGE    := dbos-poc:$(VERSION)
 # The node container is hidden from `docker ps`, but `docker exec` reaches it.
 NODE     := desktop-control-plane
 
+# Deployment names must be DNS-1123, so dots become dashes: 0.1.13 -> 0-1-13.
+DEPLOY_NAME := dbos-poc-$(subst .,-,$(VERSION))
+
 RENDER_DIR := .rendered
 MANIFEST   := $(RENDER_DIR)/app-$(VERSION).yaml
 KUBECTL    := kubectl -n $(NS)
+
+# Run a Python one-liner inside any app pod. Used to reach the Service from
+# inside the cluster without pulling a second image.
+define in_pod
+$(KUBECTL) exec $$($(KUBECTL) get pod -l app=dbos-poc -o name | head -1) -c app -- \
+  /app/.venv/bin/python -c "from urllib.request import urlopen, Request; $(1)"
+endef
 PSQL       := $(KUBECTL) exec -i postgres-0 -- psql -U dbos -d dbos_poc -c
 
 .DEFAULT_GOAL := help
@@ -35,7 +45,6 @@ infra: ## Create the namespace, Secret, Postgres and the RBAC the app needs
 	kubectl apply -f k8s/05-secret.yaml
 	kubectl apply -f k8s/10-postgres.yaml
 	kubectl apply -f k8s/20-rbac.yaml
-	kubectl apply -f k8s/25-pdb.yaml
 	$(KUBECTL) rollout status statefulset/postgres --timeout=180s
 
 .PHONY: build
@@ -44,13 +53,22 @@ build: ## Build and load $(IMAGE) into the node's image store
 	docker save $(IMAGE) | docker exec -i $(NODE) ctr -n k8s.io images import -
 
 .PHONY: deploy
-deploy: ## Roll out the current version (build first)
-	@echo ">> image=$(IMAGE) application_version=$(VERSION) replicas=$(REPLICAS)"
+deploy: ## Bring up this version's fleet, then point the Service at it (build first)
+	@echo ">> deployment=$(DEPLOY_NAME) image=$(IMAGE) replicas=$(REPLICAS)"
 	@mkdir -p $(RENDER_DIR)
 	@sed -e 's|__IMAGE__|$(IMAGE)|g' -e 's|__VERSION__|$(VERSION)|g' \
+	     -e 's|__DEPLOY_NAME__|$(DEPLOY_NAME)|g' \
 	     -e 's|__REPLICAS__|$(REPLICAS)|g' k8s/30-app.yaml > $(MANIFEST)
+	@# The fleet first. Nothing is replaced — this creates a Deployment alongside
+	@# any older ones, which keep running and keep their traffic until the next
+	@# step moves it.
 	kubectl apply -f $(MANIFEST)
-	@echo ">> old pods stay up until they drain; watch with 'make status'"
+	$(KUBECTL) rollout status deployment/$(DEPLOY_NAME) --timeout=300s
+	@# The cutover, once the new pods are Ready: one selector field. Older fleets
+	@# leave the endpoint list here, and carry on working on their own backlog.
+	@sed -e 's|__VERSION__|$(VERSION)|g' k8s/26-service.yaml > $(RENDER_DIR)/service.yaml
+	kubectl apply -f $(RENDER_DIR)/service.yaml
+	@echo ">> traffic now goes to $(VERSION); older fleets work on until drained"
 
 .PHONY: bump
 bump: ## Cut a new application version
@@ -62,12 +80,33 @@ version: ## Print the project version, which is the DBOS application version
 	@echo $(VERSION)
 
 .PHONY: status
-status: ## Pods by version, and the dbos schema's own view of the work
+status: ## Fleets, pods, the Service target, and the dbos schema's view of the work
+	@echo "-- fleets (one Deployment per version) --"
+	@$(KUBECTL) get deployments -l app=dbos-poc -L version
+	@echo ""
+	@echo "-- Service routes to version --"
+	@$(KUBECTL) get service dbos-poc -o jsonpath='{.spec.selector.version}{"\n"}' 2>/dev/null \
+	  || echo "(no Service yet)"
+	@echo ""
 	@$(KUBECTL) get pods -L version
 	@echo ""
 	@$(PSQL) "SELECT application_version AS version, status, count(*) \
 	          FROM dbos.workflow_status GROUP BY 1,2 ORDER BY 1,2;" 2>/dev/null \
 	  || echo "(no database yet)"
+
+.PHONY: api
+api: ## Call the Service and report which version answered
+	@# Sent through the Service, so the reply is the selector's answer, not a
+	@# pod's. Issued from inside an arbitrary app pod — which may well be an OLD
+	@# one, and the reply still names the new version. That is the demonstration:
+	@# an old pod is running, reachable and working, and receives no traffic.
+	@#
+	@# The app image already has an interpreter, so this pulls nothing.
+	@$(call in_pod,print(urlopen('http://dbos-poc/version').read().decode()))
+
+.PHONY: work
+work: ## Ask the Service to start one parent workflow
+	@$(call in_pod,print(urlopen(Request('http://dbos-poc/work',method='POST')).read().decode()))
 
 .PHONY: logs
 logs: ## Follow every app pod's logs
@@ -118,7 +157,9 @@ dbos_reset: ## Drop the DBOS system database, running the CLI in a live app pod
 	@# ever appear without URLs in it, quietly resets a local SQLite file.
 	@#
 	@# Needs a running pod, and fails saying so if there is none.
-	$(KUBECTL) exec deployment/dbos-poc -c app -- sh -c \
+	@# Any app pod of any version will do — they all share one system database.
+	@# Selected by label rather than by Deployment name, which now varies.
+	$(KUBECTL) exec $$($(KUBECTL) get pod -l app=dbos-poc -o name | head -1) -c app -- sh -c \
 	  'set -a; . /app/.env; set +a; \
 	   uv run dbos reset --yes --sys-db-url "$$DBOS_SYSTEM_DATABASE_URL"'
 
@@ -126,13 +167,15 @@ dbos_reset: ## Drop the DBOS system database, running the CLI in a live app pod
 reset: dbos_reset ## Reset the DBOS system database, then remove the app
 	@# Order matters: dbos_reset needs a live pod to run in. The drop uses
 	@# WITH (FORCE) and takes the database out from under the running pods, so
-	@# they have to go straight after. Deleting the Deployment (rather than
-	@# scaling it) also drops the old ReplicaSets, so nothing lingers from a
-	@# previous version. Postgres and its volume are untouched.
-	-$(KUBECTL) delete deployment dbos-poc --ignore-not-found --wait=false
+	@# they have to go straight after. Every version's fleet goes, selected by
+	@# label rather than by name, along with each fleet's budget — retirement
+	@# would normally remove both, but a reset does not wait for a drain.
+	@# Postgres and its volume are untouched.
+	-$(KUBECTL) delete deployment,poddisruptionbudget -l app=dbos-poc \
+	  --ignore-not-found --wait=false
 	@# A short grace period, not --force. Two failure modes to thread between:
 	@#
-	@#   * the pod's own 1500s grace: on SIGTERM the app drains, and with the
+	@#   * the pod's own grace period: on SIGTERM the app drains, and with the
 	@#     database dropped it just polls a database that no longer exists until
 	@#     the grace expires. (`--now` on the Deployment does not help — that
 	@#     sets grace on that object, not on the pods.)
