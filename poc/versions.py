@@ -28,6 +28,14 @@ keep the drain from ever reaching zero. :func:`recover_and_drain_version`
 composes them at the call site rather than hiding the dependency inside the
 drain. The composition runs one way: draining needs orphan recovery, not the
 other way round.
+
+**What is not here.** Nothing in this module retires a version. Deciding that an
+old version is finished and deleting its Deployment is an operator's job, not the
+application's: it is a write to the cluster, it needs no DBOS runtime, and one
+scheduled run does for the whole fleet. It lives in ``make retire``, which cron
+calls every five minutes. The app reads pods to find dead executors and it reads
+its own tables to count work; it does not read Deployments and it changes nothing
+in the cluster.
 """
 
 import threading
@@ -244,145 +252,11 @@ def cancel_stranded_versions(
     return cancelled
 
 
-def _superseded_at_ms() -> dict[str, int]:
-    """Version -> when it stopped being latest, in epoch ms.
-
-    A version was superseded by the first version registered after it, so its
-    clock starts at that successor's registration. Using the *latest* version's
-    timestamp instead would restart an old version's clock every time a newer
-    one appeared, quietly extending its life.
-
-    The latest version is absent from the result: nothing has superseded it.
-    """
-    registered = sorted(
-        (v["version_timestamp"], v["version_name"])
-        for v in DBOS.list_application_versions()
-    )
-    return {
-        name: registered[i + 1][0]
-        for i, (_, name) in enumerate(registered)
-        if i + 1 < len(registered)
-    }
-
-
-def retire_drained_versions(
-    namespace: str, me: str, max_age_sec: float = 0.0
-) -> list[str]:
-    """Delete the Deployment of every older version that owns no active work.
-
-    This is what lets an old version take an hour. Each version runs in its own
-    Deployment, so its pods are ordinary Running pods, not pods in Terminating.
-    Nothing counts down against them: ``terminationGracePeriodSeconds`` bounds a
-    pod that Kubernetes is already deleting, and Kubernetes is not deleting these.
-    They lose their API traffic the moment the Service selector moves to the new
-    version, they keep their queue pollers, and they finish the backlog at
-    whatever pace it takes.
-
-    A Deployment always restarts a container that exits, so an old pod cannot
-    retire itself by exiting — it would come back. The Deployment has to go, and
-    something outside it has to delete it. That something is here: the pods of
-    the **latest** version, which are the ones certain to still be running.
-
-    Deleting the Deployment sends its pods SIGTERM, and their drain then finds
-    nothing left and returns at once. SIGTERM arrives at the *end* of an old
-    version's life rather than at the start of it, which is the whole inversion.
-
-    Four guards, each covering a different way this could destroy work:
-
-    1. Only the latest version retires anything. An old version must not delete
-       another old version's fleet, and it cannot delete its own.
-    2. Only versions DBOS has seen launch. A version registers itself in
-       ``dbos.application_versions`` when its first pod launches, which is
-       several seconds after its Deployment is created. In that window the
-       incoming version has a Deployment, no pods and no work, and the outgoing
-       version is still ``latest`` — so without this guard the old fleet deletes
-       the new one on sight. Measured: 4 seconds after a deploy, before the new
-       pods had finished starting. "Has no work" and "has not started yet" look
-       identical from the database, and only the registry tells them apart.
-    3. Only versions with zero active work. The count comes from the same query
-       the drain uses, so "drained" means one thing in this codebase.
-    4. Unknown is not none. If the API cannot be reached, the lookup returns
-       None and this returns at once, rather than reading a failed call as "no
-       deployments" and retiring every version.
-
-    Returns the versions that this call retired.
-    """
-    latest = DBOS.get_latest_application_version()["version_name"]
-    if me != latest:
-        return []
-
-    deployments = k8s.deployments_by_version(namespace)
-    if deployments is None:
-        return []
-
-    launched = {v["version_name"] for v in DBOS.list_application_versions()}
-    superseded = _superseded_at_ms()
-
-    active_by_version: dict[str, int] = {}
-    for wf in _active():
-        if wf.app_version:
-            active_by_version[wf.app_version] = (
-                active_by_version.get(wf.app_version, 0) + 1
-            )
-
-    retired: list[str] = []
-    for version, name in sorted(deployments.items()):
-        if version == latest:
-            continue
-        if version not in launched:
-            logger.info(
-                "version has a deployment but has never launched; not retiring it",
-                version=version,
-                deployment=name,
-            )
-            continue
-        active = active_by_version.get(version, 0)
-        if active:
-            superseded_at = superseded.get(version)
-            age_sec = (
-                (time.time() * 1000 - superseded_at) / 1000.0
-                if superseded_at is not None
-                else 0.0
-            )
-            if max_age_sec <= 0 or age_sec < max_age_sec:
-                logger.info(
-                    "older version still has work; its deployment stays",
-                    version=version,
-                    deployment=name,
-                    active=active,
-                    age_sec=round(age_sec, 1),
-                    max_age_sec=max_age_sec,
-                )
-                continue
-            # Past the deadline. Deleting the fleet still gives its pods a drain,
-            # so work that finishes inside the budget is not lost. Whatever is
-            # left becomes a stranded version, which cancel_stranded_versions
-            # cancels — one mechanism and one loud line for "work was destroyed",
-            # rather than a second cancel path here.
-            logger.warning(
-                "FORCING retirement: version coexisted past the deadline with "
-                "work still active, which will be cancelled if it cannot drain",
-                version=version,
-                deployment=name,
-                active=active,
-                age_sec=round(age_sec, 1),
-                max_age_sec=max_age_sec,
-            )
-        if k8s.delete_deployment(namespace, name):
-            logger.warning(
-                "retired a drained version: deleted its deployment",
-                version=version,
-                deployment=name,
-            )
-            retired.append(version)
-        # Always, not only when this pod won the delete: the budget shares the
-        # Deployment's name but not its ownership, so nothing else removes it.
-        k8s.delete_pdb(namespace, name)
-    return retired
-
-
 def start_supervisor(s: Settings, stop: threading.Event) -> None:
-    """Sweep every problem until stopped.
+    """Sweep both halves of problem 1 until stopped.
+
+    Retirement is not swept here. ``make retire`` does it from cron, because the
+    decision is a write to the cluster and this app holds no rights to make one.
 
     Keeps running while the pod drains, so a draining pod still adopts the work
     of a sibling that crashed. The caller must set ``stop`` before
@@ -402,11 +276,5 @@ def start_supervisor(s: Settings, stop: threading.Event) -> None:
                 )
             except Exception:
                 logger.exception("stranded-version sweep failed")
-            try:
-                retire_drained_versions(
-                    s.pod_namespace, DBOS.application_version, s.retire_max_age_sec
-                )
-            except Exception:
-                logger.exception("version retirement sweep failed")
 
     threading.Thread(target=loop, daemon=True, name="supervisor").start()

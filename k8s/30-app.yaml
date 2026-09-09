@@ -14,9 +14,10 @@
 #     API traffic when k8s/26-service.yaml moves its selector, and finishes the
 #     backlog it already owns — for an hour, if that is how long it takes.
 #
-# retire_drained_versions (poc/versions.py) deletes this object once its version
-# owns no active work, or once it has coexisted with a newer version past
-# retire_max_age_sec. That deletion is what finally sends SIGTERM to these pods.
+# `make retire`, run from cron every five minutes, deletes this object once its
+# version owns no active work, or once it has coexisted with a newer version
+# past RETIRE_MAX_AGE_SEC. That deletion is what finally sends SIGTERM to these
+# pods. The app itself cannot do it: it has no rights to write to the cluster.
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -24,9 +25,9 @@ metadata:
   namespace: dbos-poc
   labels:
     app: dbos-poc
-    # Read by poc/k8s.py to answer "which versions still have a fleet". It is on
-    # the Deployment as well as the pods, so a version is identifiable even
-    # before its pods exist.
+    # Read by `make retire` to find this fleet and delete it. It is on the
+    # Deployment as well as the pods, so a version is identifiable even before
+    # its pods exist.
     version: "__VERSION__"
 spec:
   replicas: __REPLICAS__
@@ -163,8 +164,9 @@ spec:
 # once would compute its allowance across two Deployments, so a disruption to the
 # new version would consume the old version's protection.
 #
-# retire_drained_versions deletes this alongside the Deployment. Nothing else
-# would: it is a separate object, and a Deployment does not own it.
+# `make retire` deletes this alongside the Deployment, selecting both by the
+# version label. Nothing else would: it is a separate object, and a Deployment
+# does not own it.
 apiVersion: policy/v1
 kind: PodDisruptionBudget
 metadata:

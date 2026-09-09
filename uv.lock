@@ -316,7 +316,7 @@ wheels = [
 
 [[package]]
 name = "dbos-k8s-multi-version"
-version = "4.0.0"
+version = "6.0.0"
 source = { virtual = "." }
 dependencies = [
     { name = "dbos" },

@@ -30,6 +30,12 @@ RENDER_DIR := .rendered
 MANIFEST   := $(RENDER_DIR)/app-$(VERSION).yaml
 KUBECTL    := kubectl -n $(NS)
 
+# Hard limit on how long two DBOS versions may coexist, in seconds. 24 hours.
+# Past it, `make retire` deletes the old fleet whether or not it has drained,
+# which CAN DESTROY WORK — see the deadline notes on that target. Set 0 to
+# disable it and let a version live until it is empty.
+RETIRE_MAX_AGE_SEC := 86400
+
 # Run a Python one-liner inside any app pod. Used to reach the Service from
 # inside the cluster without pulling a second image.
 define in_pod
@@ -37,6 +43,45 @@ $(KUBECTL) exec $$($(KUBECTL) get pod -l app=dbos-poc -o name | head -1) -c app 
   /app/.venv/bin/python -c "from urllib.request import urlopen, Request; $(1)"
 endef
 PSQL       := $(KUBECTL) exec -i postgres-0 -- psql -U dbos -d dbos_poc -c
+# The same database, machine-readable: one record per line, fields separated by
+# `|`, no header and no padding. For reading in a shell loop.
+PSQL_ROWS  := $(KUBECTL) exec -i postgres-0 -- psql -U dbos -d dbos_poc -qAt -F'|' -c
+
+# The whole retirement decision, as one query. It returns one line for each
+# version that MAY be considered:
+#
+#   version_name | active workflows | seconds since it stopped being latest
+#
+# Each guard is a clause, and the reason each is here is in the README under
+# "How a version retires":
+#
+#   * Not the latest version. LEAD is NULL for the newest registered row, so
+#     `superseded_at IS NOT NULL` drops it. A version cannot retire itself.
+#   * Only versions DBOS has seen launch. The rows come from
+#     dbos.application_versions, and a version registers there when its first
+#     pod launches — several seconds after its Deployment is created. Reading
+#     Deployments alone would find the incoming fleet with no work and retire it
+#     on sight. Measured at 4 seconds after a deploy, before its pods were up.
+#   * How much work it still owns. The same three statuses the in-process drain
+#     counts, so "drained" means one thing in this repo.
+#   * How long it has been superseded: now, less its successor's registration.
+#     Not the Deployment's creationTimestamp, which is immutable and survives
+#     every patch release, so it would report the age of the first deploy of
+#     that major version — potentially months.
+RETIRE_QUERY := WITH superseded AS ( \
+    SELECT version_name, \
+           LEAD(version_timestamp) OVER (ORDER BY version_timestamp) AS superseded_at \
+      FROM dbos.application_versions \
+  ), active AS ( \
+    SELECT application_version AS version_name, count(*) AS n \
+      FROM dbos.workflow_status \
+     WHERE status IN ('PENDING','ENQUEUED','DELAYED') \
+     GROUP BY 1 \
+  ) \
+  SELECT s.version_name, COALESCE(a.n, 0), \
+         ((EXTRACT(EPOCH FROM now()) * 1000 - s.superseded_at) / 1000)::bigint \
+    FROM superseded s LEFT JOIN active a USING (version_name) \
+   WHERE s.superseded_at IS NOT NULL ORDER BY 1
 
 .DEFAULT_GOAL := help
 
@@ -87,6 +132,79 @@ deploy: ## Deploy $(VERSION): rolling update, or a new fleet on a major bump
 	@sed -e 's|__VERSION__|$(DBOS_VERSION)|g' k8s/26-service.yaml > $(RENDER_DIR)/service.yaml
 	kubectl apply -f $(RENDER_DIR)/service.yaml
 	@echo ">> traffic now goes to DBOS version $(DBOS_VERSION) (code $(VERSION))"
+
+.PHONY: retire
+retire: ## Delete the fleet of every older version that has finished its work
+	@# THE CRON ENTRY POINT, and the other half of a deploy.
+	@#
+	@# Deploying is a person's decision. Retiring is not: it is one question —
+	@# "is that old fleet finished yet" — asked over and over until the answer is
+	@# yes. A schedule asks it better than a person, and better than the app.
+	@#
+	@# It is deliberately outside the cluster. The app reads pods, because only
+	@# the API server can say whether the executor that claimed a row still
+	@# exists. It reads nothing else and it writes nothing at all. An application
+	@# that can delete its own Deployment is a much larger blast radius than one
+	@# that can list pods, and it buys nothing: the decision needs no DBOS
+	@# runtime, only the system database and kubectl.
+	@#
+	@# THE PROCEDURE TO FOLLOW (this repo does not install it):
+	@#
+	@#   1. Check the repository out on a host that has kubectl, with a context
+	@#      for this cluster and rights to delete deployments and
+	@#      poddisruptionbudgets in the $(NS) namespace.
+	@#   2. Add one crontab entry, every five minutes:
+	@#
+	@#        */5 * * * * cd /srv/dbos-poc && make retire >> /var/log/dbos-retire.log 2>&1
+	@#
+	@#   3. Nothing else. The host needs no database credentials: every read goes
+	@#      through `kubectl exec postgres-0 -- psql`.
+	@#
+	@# Five minutes is a latency, not a risk. A fleet that has finished its
+	@# backlog idles until the next run: it receives no traffic, it creates no
+	@# work, and nothing waits on it. The only cost is the pods it holds.
+	@#
+	@# Safe to run at any time, by hand or from cron, and safe to run twice at
+	@# once: deleting an object that another run already deleted is a no-op here.
+	@#
+	@# The delete takes both objects, selected by the version label. The budget
+	@# is named after the Deployment but is not owned by it, so deleting the
+	@# Deployment alone would leave one budget behind for every version ever
+	@# deployed.
+	@#
+	@# A version whose fleet has already gone is passed over in silence. Every
+	@# version ever deployed stays in the registry, so reporting those would grow
+	@# the cron log without bound and bury the lines that matter. One header line
+	@# for each run is enough to show that cron is alive.
+	@#
+	@# No comments inside the recipe below: make hands the whole
+	@# backslash-continued block to the shell as ONE logical line, so a `#` would
+	@# comment out everything after it.
+	@rows=$$($(PSQL_ROWS) "$(RETIRE_QUERY)") || \
+	  { echo ">> the system database did not answer; retiring nothing"; exit 1; }; \
+	if [ -z "$$rows" ]; then \
+	  echo ">> only one version has ever launched; nothing to retire"; exit 0; \
+	fi; \
+	echo ">> $$(echo "$$rows" | wc -l) superseded version(s) registered, deadline $(RETIRE_MAX_AGE_SEC)s"; \
+	while IFS='|' read -r version active age; do \
+	  test -n "$$version" || continue; \
+	  if [ -z "$$($(KUBECTL) get deployment -l app=dbos-poc,version=$$version -o name)" ]; then \
+	    continue; \
+	  fi; \
+	  if [ "$$active" -eq 0 ]; then \
+	    echo ">> $$version: drained, retiring it (superseded $${age}s ago)"; \
+	  elif [ "$(RETIRE_MAX_AGE_SEC)" -gt 0 ] && [ "$$age" -ge "$(RETIRE_MAX_AGE_SEC)" ]; then \
+	    echo ">> $$version: FORCING retirement with $$active workflows still active,"; \
+	    echo ">>   superseded $${age}s ago, past the $(RETIRE_MAX_AGE_SEC)s deadline."; \
+	    echo ">>   Its pods drain on SIGTERM, so work that fits inside the drain"; \
+	    echo ">>   budget still finishes. The rest is cancelled by the app, loudly."; \
+	  else \
+	    echo ">> $$version: keeping it, $$active workflows still active (superseded $${age}s ago)"; \
+	    continue; \
+	  fi; \
+	  echo ">> deleting the fleet is what finally sends SIGTERM to its pods"; \
+	  $(KUBECTL) delete deployment,poddisruptionbudget -l app=dbos-poc,version=$$version; \
+	done <<< "$$rows"
 
 .PHONY: bump
 bump: ## Cut a new release. PART=patch (default), minor, or major

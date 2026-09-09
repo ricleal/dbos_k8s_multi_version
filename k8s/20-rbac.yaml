@@ -1,16 +1,15 @@
-# Two reads and one write.
+# One read, and nothing else.
 #
 # Reading pods is the liveness oracle: DBOS keeps no register of live executors,
 # so the API server answers "does the pod that claimed this row still exist".
+# That is the whole reason this app holds any cluster credential.
 #
-# Reading deployments answers a different question — which versions still have a
-# fleet. Deleting one retires a whole version, and it is the only mutation this
-# app makes to the cluster. It is needed because a Deployment always restarts a
-# container that exits, so an old version cannot retire itself by exiting: the
-# pods of the latest version delete its Deployment once it owns no work. See
-# retire_drained_versions in poc/versions.py.
+# It cannot read Deployments and it cannot delete anything. Retiring a version
+# needs both, and that decision belongs to an operator outside the cluster:
+# `make retire`, run from cron. An application that can delete its own fleet is
+# a larger blast radius than an application that can list pods.
 #
-# Cancelling stranded work is still a database write, not a Kubernetes one.
+# Cancelling stranded work is a database write, not a Kubernetes one.
 apiVersion: v1
 kind: ServiceAccount
 metadata:
@@ -26,16 +25,6 @@ rules:
   - apiGroups: [""]
     resources: ["pods"]
     verbs: ["get", "list"]
-  - apiGroups: ["apps"]
-    resources: ["deployments"]
-    # No create and no update. This app never brings a version up — that is the
-    # deploy's job — it only removes one that has finished.
-    verbs: ["get", "list", "delete"]
-  - apiGroups: ["policy"]
-    resources: ["poddisruptionbudgets"]
-    # Each version has its own budget, named after its Deployment but not owned
-    # by it, so retirement has to delete it explicitly or it would accumulate.
-    verbs: ["get", "list", "delete"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding
