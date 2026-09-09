@@ -1278,11 +1278,25 @@ make clean          # delete the namespace and the Postgres volume
 - **`TARGET_VALUE` and `worker_concurrency` are one number in two files.**
   Nothing checks that they agree. If they drift, the autoscaler aims at a fleet
   that is too small to keep up or larger than the queue can use.
+- **The depth endpoint counts by fetching rows.** DBOS exposes no count API, so
+  `queue_depth()` calls `list_queued_workflows` and takes the length: a
+  200-deep queue means 200 rows read and 200 objects built, every 15 seconds,
+  for each fleet. Correct but wasteful, and the waste grows with the backlog.
+  A `SELECT count(*)` against `dbos.workflow_status` would be cheaper at the
+  cost of reaching past the SDK.
+- **Scale-down can still remove a pod that is working.** Counting `PENDING`
+  prevents it while pods are saturated, but not in the tail of a drain, where
+  ten pods may hold twelve workflows and KEDA asks for six. The rows are adopted
+  by a surviving pod, and that path is not exercised here: the stabilization
+  window is 60s and a child takes about 16s, so every drain observed finished
+  before the window expired. See
+  [Why scaling down does not lose work](#why-scaling-down-does-not-lose-work).
 - **Retirement is as late as the schedule.** A drained fleet idles until the
-  next `make retire`, so up to five minutes of pods that have nothing to do. It
-  holds no traffic and creates no work, so the cost is the pods and nothing
-  else. If a version must go sooner, run the target by hand — it is safe at any
-  time.
+  next `make retire`, so up to five minutes of pods that have nothing to do. The
+  autoscaler softens this: an empty version reaches `MIN_REPLICAS` about a minute
+  after its last workflow finishes, so what waits for cron is one idle pod rather
+  than a fleet. It holds no traffic and creates no work. If a version must go
+  sooner, run the target by hand — it is safe at any time.
 - **A missed schedule delays the deadline.** If cron does not run, nothing
   retires. The 24-hour clock is a column and does not drift, so the deadline is
   enforced on the first run after it passes, not skipped — but "24 hours" means
