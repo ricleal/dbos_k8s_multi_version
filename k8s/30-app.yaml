@@ -57,20 +57,21 @@ spec:
         # inside this DBOS version.
         code-version: "__CODE_VERSION__"
     spec:
-      # The ceiling for an UNPLANNED stop only — a node drain, an eviction, or the
-      # retirement delete once this version is already drained. A planned
-      # retirement never runs out of time here, because nothing sends SIGTERM
-      # until the work is finished.
+      # No terminationGracePeriodSeconds, so Kubernetes uses its 30s default, and
+      # the app does not need even that: it installs no signal handler, so
+      # SIGTERM ends the process at once.
       #
-      # INVARIANT: drain + margin <= grace, which the app checks at startup.
-      #   drain 100s + margin 20s = 120s
+      # Nothing is lost by that. A version is retired only once `make retire`
+      # sees it own no active work, so SIGTERM arrives when there is nothing left
+      # to finish. For an unplanned stop — a node drain, an eviction, a lost
+      # machine — the pod's PENDING rows are adopted by a live sibling of the same
+      # version within a sweep, from their last completed step.
       #
-      # Kept short deliberately. A grace period is a promise the platform may not
-      # keep: `kubectl drain` waits it out in full, cluster-autoscaler
-      # force-deletes after --max-graceful-termination-sec (10 minutes by
-      # default), and spot preemption gives 30s-2min. Long work is handled by
-      # outliving the rollout, not by a longer grace period.
-      terminationGracePeriodSeconds: 120
+      # A long grace period was never the answer here anyway. It is a promise the
+      # platform may not keep: `kubectl drain` waits it out in full,
+      # cluster-autoscaler force-deletes after --max-graceful-termination-sec
+      # (10 minutes by default), and spot preemption gives 30s-2min. Long work
+      # outlives the rollout instead, in its own fleet.
       serviceAccountName: dbos-poc
       initContainers:
         - name: wait-for-postgres
@@ -97,9 +98,8 @@ spec:
               containerPort: 8080
           # No preStop hook. Its usual job is to delay SIGTERM while a Service
           # drops the pod from its endpoints. Here the Service selector moves to
-          # the new version instead, long before SIGTERM, so a hook would only
-          # delay the drain — and one that outlasts the grace period gives the
-          # kubelet a shutdown it cannot finish on time.
+          # the new version instead, long before SIGTERM, so there is nothing for
+          # a hook to wait for.
           volumeMounts:
             # The database URL arrives as a file, not an environment variable:
             # k8s/05-secret.yaml projected at /app/.env, which is exactly where
@@ -137,7 +137,8 @@ spec:
           # finishing an old version's backlog is healthy, and marking it
           # NotReady would say otherwise while changing nothing about routing.
           #
-          # No liveness probe either — it would risk restarting a pod mid-drain.
+          # No liveness probe either — it would risk restarting a pod that is
+          # working through a backlog nothing else may run.
           resources:
             requests:
               cpu: 100m

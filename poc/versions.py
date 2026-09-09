@@ -10,32 +10,29 @@ of the same version exists. :func:`cancel_stranded_versions` handles the case
 where none does.
 
 **Problem 2 — application version.** A major bump brings up a fleet of a new
-DBOS version. Work belonging to the old version cannot run on it:
-the dequeue predicate is ``application_version == mine``
-(``_sys_db.py`` -> ``start_queued_workflows``), which is exactly the safety
-property we want — old work must not execute against new code. So nothing needs
-to be built to *prevent* it. What must be built is the wait:
-:func:`drain_version` tells a retiring pod whether its version still owns work.
+DBOS version. Work belonging to the old version cannot run on it: the dequeue
+predicate is ``application_version == mine`` (``_sys_db.py`` ->
+``start_queued_workflows``), which is exactly the safety property we want — old
+work must not execute against new code. So nothing needs to be built to *prevent*
+it. What must be built is the wait, and no code in this process does that either.
 
-The two are kept separate on purpose. :func:`drain_version` is pure DBOS — it
-counts what a version still owns and needs no Kubernetes API, no liveness oracle
-and nothing cluster-specific, which is the whole mechanism behind a safe rolling
-deployment. :func:`recover_orphaned_workflows` is the Kubernetes-specific half,
-because only the API server can say which executors are still alive.
+The wait is the deploy procedure. Each DBOS version owns a Deployment, so an old
+fleet is not replaced and is not ``Terminating``: it keeps its pods and its queue
+pollers, loses only its API traffic, and finishes its backlog at its own pace.
+``make retire`` then deletes that fleet, and only once the system database says
+the version owns no active work. No pod has to hold itself open, because nothing
+is trying to stop it.
 
-A pod shutting down wants both, since orphaned rows count as active and would
-keep the drain from ever reaching zero. :func:`recover_and_drain_version`
-composes them at the call site rather than hiding the dependency inside the
-drain. The composition runs one way: draining needs orphan recovery, not the
-other way round.
+That is why this module handles no signals and has no drain. A pod dies the
+moment Kubernetes stops it, and the cost is the step in progress: recovery
+re-enqueues in place, so the workflow resumes from its last completed step.
 
-**What is not here.** Nothing in this module retires a version. Deciding that an
-old version is finished and deleting its Deployment is an operator's job, not the
-application's: it is a write to the cluster, it needs no DBOS runtime, and one
-scheduled run does for the whole fleet. It lives in ``make retire``, which cron
-calls every five minutes. The app reads pods to find dead executors and it reads
-its own tables to count work; it does not read Deployments and it changes nothing
-in the cluster.
+**What is not here.** Nothing in this module retires a version, and nothing
+counts how much work a version still owns. Both belong to the retirement
+decision, which is a write to the cluster and needs no DBOS runtime, so both live
+in ``make retire`` — one scheduled run for the whole fleet. This app reads pods
+to find dead executors and its own tables to find their work; it does not read
+Deployments and it changes nothing in the cluster.
 """
 
 import threading
@@ -143,43 +140,6 @@ def recover_orphaned_workflows(version: str, namespace: str) -> int:
     return len(handles)
 
 
-def drain_version(version: str) -> int:
-    """Problem 2: how much work does this version still own? 0 means drained.
-
-    Deliberately pure DBOS. There is no Kubernetes here, no liveness oracle and
-    no orphan recovery: "does my version still own active work" is answered
-    entirely by ``dbos.workflow_status``. That is what makes a safe rolling
-    deployment cheap — the whole version half of this PoC is this one query. See
-    *Deploying a new version* in the README.
-
-    Counts what the VERSION owns, fleet-wide, not what this pod owns. That is
-    right for a retiring version and wrong for a rolling update inside one
-    version, where it would include the replacements' work. ``shut_down()`` in
-    main.py is what keeps the two apart.
-
-    Takes no namespace for the same reason it takes no API client: it does not
-    need one. A caller draining on SIGTERM usually wants recovery as well, and
-    asks for it explicitly through :func:`recover_and_drain_version`.
-    """
-    return len(_active(version))
-
-
-def recover_and_drain_version(version: str, namespace: str) -> int:
-    """Adopt this version's orphaned work, then report what it still owns.
-
-    What a pod shutting down actually wants, and the only place the two problems
-    meet. Draining alone can stall: a sibling that died mid-drain leaves PENDING
-    rows nobody will ever run, and they count as active forever. Recovering first
-    hands them back to a live pod of this version — possibly this one.
-
-    Kept as a composition rather than folded into :func:`drain_version` so the
-    version machinery stays independently usable by anyone who already has
-    executor recovery from somewhere else.
-    """
-    recover_orphaned_workflows(version, namespace)
-    return drain_version(version)
-
-
 def cancel_stranded_versions(
     namespace: str, grace_sec: float, me: str
 ) -> dict[str, int]:
@@ -252,20 +212,22 @@ def cancel_stranded_versions(
     return cancelled
 
 
-def start_supervisor(s: Settings, stop: threading.Event) -> None:
-    """Sweep both halves of problem 1 until stopped.
+def start_supervisor(s: Settings) -> None:
+    """Sweep both halves of problem 1 for as long as the process lives.
 
     Retirement is not swept here. ``make retire`` does it from cron, because the
     decision is a write to the cluster and this app holds no rights to make one.
 
-    Keeps running while the pod drains, so a draining pod still adopts the work
-    of a sibling that crashed. The caller must set ``stop`` before
-    ``DBOS.destroy()``: the loop reads ``DBOS.application_version``, which
-    destroy() resets.
+    A daemon thread with no stop condition. There used to be one, because the
+    loop reads ``DBOS.application_version`` and ``DBOS.destroy()`` resets it, so
+    a draining pod had to stop sweeping before it called destroy(). Nothing
+    calls destroy() now: the process handles no signals and dies where it
+    stands.
     """
 
     def loop() -> None:
-        while not stop.wait(timeout=s.sweep_interval_sec):
+        while True:
+            time.sleep(s.sweep_interval_sec)
             try:
                 recover_orphaned_workflows(DBOS.application_version, s.pod_namespace)
             except Exception:

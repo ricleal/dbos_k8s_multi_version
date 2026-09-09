@@ -75,7 +75,10 @@ def serve(s: Settings) -> None:
             app, host="0.0.0.0", port=s.http_port, log_level="warning", log_config=None
         )
     )
-    # This process owns SIGTERM: it must run the drain, not let uvicorn exit first.
+    # uvicorn installs signal handlers in Server.run, and signal.signal raises
+    # from any thread but the main one. This server runs in a thread, so the
+    # install has to be disabled or startup fails. The process handles no signals
+    # at all: SIGTERM ends it through the kernel's default disposition.
     server.install_signal_handlers = lambda: None  # type: ignore[method-assign]
     threading.Thread(target=server.run, daemon=True, name="http").start()
     logger.info("API listening", port=s.http_port)

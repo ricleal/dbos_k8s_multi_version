@@ -1,27 +1,37 @@
-"""Entry point: launch DBOS, start the work, supervise the fleet, drain on SIGTERM.
+"""Entry point: launch DBOS, start the work, supervise the fleet, and stay up.
 
-The model under test, from the DBOS "Upgrading Workflows" doc: on SIGTERM keep
-the DBOS runtime and queue pollers alive and poll until this pod's own
-application_version owns no active work; only then call destroy() and exit.
-Kubernetes holds the pod open for terminationGracePeriodSeconds while that runs.
+There is no shutdown path in this file, and that is the point. The pod handles
+no signals, so SIGTERM terminates the process at once, through the kernel's
+default disposition. Nothing drains, and ``DBOS.destroy()`` is never called.
 
-Each version runs in its own Deployment, so SIGTERM does not arrive at the start
-of a version's retirement. It arrives at the end. An old version loses its API
-traffic when the Service selector moves to the new version, then keeps working
-for as long as its backlog takes, with no grace period counting against it. Only
-once it owns nothing does the latest version delete its Deployment, and only
-then does SIGTERM reach these pods — to a drain that finds nothing left.
+That is safe because the deploy procedure, not the process, is what protects the
+work. A version is retired only once it owns nothing:
 
-The drain below therefore covers two cases: that final tidy exit, and the
-unplanned ones, where a node drain or an eviction removes a pod that still has
-work.
+* **A new DBOS version** gets its own Deployment beside the old one, and the
+  Service selector moves to it. The old fleet keeps its pods and its queue
+  pollers and finishes its backlog. ``make retire`` deletes that fleet only when
+  the system database says the version owns no active work, so by the time
+  SIGTERM arrives there is nothing left to drain. A drain here would poll a
+  count that is already zero.
+* **A rolling update inside one DBOS version** replaces the pods, and the
+  replacements share the leaving pods' ``application_version``. They dequeue the
+  ENQUEUED work directly and ``recover_orphaned_workflows`` hands them the
+  PENDING rows within a sweep. Draining would be actively wrong here: it counts
+  what the *version* owns fleet-wide, including work the replacements are
+  creating, so it would never reach zero.
+
+An abrupt stop therefore costs at most the step in progress. Recovery
+re-enqueues in place, so a workflow resumes from its last completed step rather
+than starting again.
+
+The one case that loses work is a fleet retired past ``RETIRE_MAX_AGE_SEC`` with
+work still active. Without a drain, that work is abandoned immediately instead of
+being given a last window to finish, and ``cancel_stranded_versions`` cancels it.
+That is the deadline's declared purpose — see *The 24-hour deadline* in the
+README.
 """
 
-import signal
-import sys
 import threading
-import time
-import types
 
 from dbos import DBOS
 
@@ -30,130 +40,8 @@ from poc.config import Settings
 
 logger = logs.get_logger("poc")
 
-EXIT_CLEAN = 0
-EXIT_TRUNCATED = 75
 
-_sigterm = threading.Event()
-_sigterm_at: float = 0.0
-
-
-def _elapsed() -> float:
-    return time.monotonic() - _sigterm_at
-
-
-def _on_sigterm(signum: int, _frame: types.FrameType | None) -> None:
-    global _sigterm_at
-    if _sigterm.is_set():
-        return
-    _sigterm_at = time.monotonic()
-    _sigterm.set()
-    logger.info(
-        "SIGTERM received; starting drain",
-        signum=signal.Signals(signum).name,
-        elapsed=0.0,
-    )
-
-
-def drain_to_empty(s: Settings, stop_supervisor: threading.Event) -> int:
-    """Keep the pollers alive until this version owns no active work."""
-    deadline = _sigterm_at + s.drain_budget_sec
-    version = DBOS.application_version
-    logger.info(
-        "draining to empty",
-        elapsed=round(_elapsed(), 1),
-        budget_sec=s.drain_budget_sec,
-        grace_sec=s.grace_period_sec,
-        drain_margin_sec=s.drain_margin_sec,
-    )
-
-    polls = 0
-    while True:
-        # Recovery is composed in here, not inside drain_version: the drain is
-        # pure DBOS, and adopting a sibling's orphans is the Kubernetes-specific
-        # extra a shutting-down pod also needs.
-        remaining = versions.recover_and_drain_version(version, s.pod_namespace)
-        polls += 1
-        logger.info(
-            "drain poll",
-            elapsed=round(_elapsed(), 1),
-            poll_number=polls,
-            remaining_active=remaining,
-            application_version=version,
-        )
-        if remaining == 0 or time.monotonic() >= deadline:
-            break
-        time.sleep(
-            min(s.drain_poll_interval_sec, max(0.0, deadline - time.monotonic()))
-        )
-
-    truncated = remaining != 0
-    # A truncated drain must be distinguishable from a clean one. The database is
-    # the durable record: rows left active on a retired version mean the drain did
-    # not finish. Those rows are precisely what cancel_stranded_versions will find
-    # once this pod is gone and no other pod of this version remains.
-    logger.info(
-        "DRAIN_RESULT",
-        executor=DBOS.executor_id,
-        version=version,
-        outcome="truncated" if truncated else "clean",
-        drain_seconds=round(_elapsed(), 1),
-        budget_sec=s.drain_budget_sec,
-        remaining_active=remaining,
-    )
-
-    # Stop sweeping before destroy(): the loop reads DBOS.application_version,
-    # which destroy() resets.
-    stop_supervisor.set()
-
-    DBOS.destroy()
-    logger.info("destroy() returned; exiting", elapsed=round(_elapsed(), 1))
-    return EXIT_TRUNCATED if truncated else EXIT_CLEAN
-
-
-def shut_down(s: Settings, stop_supervisor: threading.Event) -> int:
-    """Pick a shutdown for the reason this pod is going away.
-
-    Two very different reasons, and one drain would be wrong for one of them.
-
-    **My version is being retired** (``mine != latest``). Nothing else in the
-    cluster may run my version's work: the dequeue predicate and DBOS's own
-    recovery both filter on ``application_version``. So this pod must finish the
-    backlog before it exits — :func:`drain_to_empty`.
-
-    **My version is still current** (``mine == latest``). This is a rolling
-    update inside one DBOS version: a patch or minor release, where
-    ``dbos_version()`` is unchanged. Draining here would be actively wrong.
-    ``drain_version`` counts what the *version* owns fleet-wide, so it would
-    include work the new pods of the same version are running and creating, and
-    would never reach zero. Every patch deploy would burn the whole drain budget
-    and then report ``truncated``.
-
-    It is also unnecessary. The replacement pods share my version, so they can
-    dequeue my ENQUEUED work directly, and :func:`recover_orphaned_workflows`
-    hands them my PENDING rows within a sweep. Re-enqueueing is in place, so a
-    workflow resumes from its last completed step rather than starting again.
-    Exiting promptly is the correct behaviour, and it depends on a live sibling
-    existing — which ``maxUnavailable: 0`` guarantees.
-    """
-    latest = DBOS.get_latest_application_version()["version_name"]
-    mine = DBOS.application_version
-
-    if mine != latest:
-        return drain_to_empty(s, stop_supervisor)
-
-    logger.info(
-        "same-version rollout: exiting without draining, siblings adopt the work",
-        version=mine,
-        elapsed=round(_elapsed(), 1),
-        still_active_for_version=versions.drain_version(mine),
-    )
-    stop_supervisor.set()
-    DBOS.destroy()
-    logger.info("destroy() returned; exiting", elapsed=round(_elapsed(), 1))
-    return EXIT_CLEAN
-
-
-def main() -> int:
+def main() -> None:
     s = Settings()
 
     logs.configure(s.log_level)
@@ -163,13 +51,7 @@ def main() -> int:
     # through the launched singleton's system database.
     workflows.register_queues()
 
-    # Installed before any work starts, so a SIGTERM arriving during startup is
-    # still drained rather than killing the process outright.
-    signal.signal(signal.SIGTERM, _on_sigterm)
-    signal.signal(signal.SIGINT, _on_sigterm)
-
-    stop_supervisor = threading.Event()
-    versions.start_supervisor(s, stop_supervisor)
+    versions.start_supervisor(s)
 
     # Served by every pod, old and new. A Service selector decides which pods
     # receive requests, so an old version keeps a working API that simply has no
@@ -178,24 +60,21 @@ def main() -> int:
 
     latest = DBOS.get_latest_application_version()["version_name"]
     is_latest = latest == DBOS.application_version
-    logger.info(
-        "launched",
-        latest_version=latest,
-        is_latest=is_latest,
-        drain_budget_sec=s.drain_budget_sec,
-    )
+    logger.info("launched", latest_version=latest, is_latest=is_latest)
 
     # Only the current version injects new work. A pod of a retired version that
-    # restarts mid-drain is here to finish the backlog, not to add to it.
+    # restarts mid-retirement is here to finish the backlog, not to add to it.
     if is_latest:
         for seq in range(s.parents_on_launch):
             logger.info(
                 "started parent workflow", workflow_id=workflows.start_parent(seq)
             )
 
-    _sigterm.wait()
-    return shut_down(s, stop_supervisor)
+    # Block forever. The queue pollers, the supervisor and the API all run in
+    # their own threads; this thread has nothing left to do but keep the process
+    # alive until Kubernetes stops it.
+    threading.Event().wait()
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    main()

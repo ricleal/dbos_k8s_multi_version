@@ -101,12 +101,12 @@ def parent_workflow(children: int, steps_per_child: int) -> list[str]:
 
     Waiting was the single worst thing this workflow could do, for three reasons:
 
-    1. **It made the drain as long as the whole backlog.** A parent blocked on
-       ``get_result()`` stays PENDING until the last child finishes, so a version
-       could not retire until every child of every parent was done — which is the
-       unbounded hold that makes a node drain or an autoscaler scale-down wait.
-       Fire-and-forget means the parent is done in milliseconds and the drain
-       waits only on children actually in flight.
+    1. **It kept a version un-retirable for the whole backlog.** A parent blocked
+       on ``get_result()`` stays PENDING until the last child finishes, and a
+       PENDING row is active work, so ``make retire`` would hold the old fleet up
+       until every child of every parent was done. Fire-and-forget means the
+       parent is done in milliseconds and only children actually in flight count
+       against retirement.
     2. **It burned a slot doing nothing.** The parent is started off-queue so it
        does not consume ``worker_concurrency``, but it still pinned a thread and a
        database connection for minutes to poll for results nobody read.
