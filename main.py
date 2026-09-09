@@ -110,6 +110,49 @@ def drain_to_empty(s: Settings, stop_supervisor: threading.Event) -> int:
     return EXIT_TRUNCATED if truncated else EXIT_CLEAN
 
 
+def shut_down(s: Settings, stop_supervisor: threading.Event) -> int:
+    """Pick a shutdown for the reason this pod is going away.
+
+    Two very different reasons, and one drain would be wrong for one of them.
+
+    **My version is being retired** (``mine != latest``). Nothing else in the
+    cluster may run my version's work: the dequeue predicate and DBOS's own
+    recovery both filter on ``application_version``. So this pod must finish the
+    backlog before it exits — :func:`drain_to_empty`.
+
+    **My version is still current** (``mine == latest``). This is a rolling
+    update inside one DBOS version: a patch or minor release, where
+    ``dbos_version()`` is unchanged. Draining here would be actively wrong.
+    ``drain_version`` counts what the *version* owns fleet-wide, so it would
+    include work the new pods of the same version are running and creating, and
+    would never reach zero. Every patch deploy would burn the whole drain budget
+    and then report ``truncated``.
+
+    It is also unnecessary. The replacement pods share my version, so they can
+    dequeue my ENQUEUED work directly, and :func:`recover_orphaned_workflows`
+    hands them my PENDING rows within a sweep. Re-enqueueing is in place, so a
+    workflow resumes from its last completed step rather than starting again.
+    Exiting promptly is the correct behaviour, and it depends on a live sibling
+    existing — which ``maxUnavailable: 0`` guarantees.
+    """
+    latest = DBOS.get_latest_application_version()["version_name"]
+    mine = DBOS.application_version
+
+    if mine != latest:
+        return drain_to_empty(s, stop_supervisor)
+
+    logger.info(
+        "same-version rollout: exiting without draining, siblings adopt the work",
+        version=mine,
+        elapsed=round(_elapsed(), 1),
+        still_active_for_version=versions.drain_version(mine),
+    )
+    stop_supervisor.set()
+    DBOS.destroy()
+    logger.info("destroy() returned; exiting", elapsed=round(_elapsed(), 1))
+    return EXIT_CLEAN
+
+
 def main() -> int:
     s = Settings()
 
@@ -151,7 +194,7 @@ def main() -> int:
             )
 
     _sigterm.wait()
-    return drain_to_empty(s, stop_supervisor)
+    return shut_down(s, stop_supervisor)
 
 
 if __name__ == "__main__":

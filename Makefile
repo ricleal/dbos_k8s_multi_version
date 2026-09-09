@@ -1,21 +1,30 @@
 SHELL := /bin/bash
 
-# The application version comes from pyproject.toml and nowhere else, so it
-# cannot disagree with the code in the image. `make bump` cuts a new one.
+# Two versions, and the difference between them decides what a deploy does.
+#
+# VERSION is the release: project.version from pyproject.toml, and the image tag.
+# DBOS_VERSION is the compatibility boundary: the MAJOR component only, as
+# v<major>, matching poc/config.py dbos_version(). It names the Deployment.
+#
+#   0.1.2 -> 0.1.3   both v0   same Deployment re-applied -> rolling update
+#   0.1.3 -> 0.2.0   both v0   same Deployment re-applied -> rolling update
+#   0.2.0 -> 1.0.0   v0 -> v1  a NEW Deployment beside the old one
 #
 # `:=`, never `?=`: `?=` yields to the environment, and .envrc runs
 # `dotenv_if_exists .env`, so a stray shell variable would silently win.
-VERSION  := $(shell python3 -c "import tomllib;print(tomllib.load(open('pyproject.toml','rb'))['project']['version'])")
-NS       := dbos-poc
-REPLICAS := 3
-IMAGE    := dbos-poc:$(VERSION)
+VERSION      := $(shell python3 -c "import tomllib;print(tomllib.load(open('pyproject.toml','rb'))['project']['version'])")
+DBOS_VERSION := v$(word 1,$(subst ., ,$(VERSION)))
+NS           := dbos-poc
+REPLICAS     := 3
+IMAGE        := dbos-poc:$(VERSION)
 
 # Docker Desktop runs Kubernetes on a kind-style node with its own image store.
 # The node container is hidden from `docker ps`, but `docker exec` reaches it.
 NODE     := desktop-control-plane
 
-# Deployment names must be DNS-1123, so dots become dashes: 0.1.13 -> 0-1-13.
-DEPLOY_NAME := dbos-poc-$(subst .,-,$(VERSION))
+# One Deployment for each DBOS version, so this name is stable across releases
+# of the same major. Already DNS-1123: v0, v1.
+DEPLOY_NAME := dbos-poc-$(DBOS_VERSION)
 
 RENDER_DIR := .rendered
 MANIFEST   := $(RENDER_DIR)/app-$(VERSION).yaml
@@ -36,7 +45,8 @@ help: ## Show this help
 	@grep -hE '^[a-zA-Z_-]+:.*?## ' $(MAKEFILE_LIST) | \
 	  awk 'BEGIN{FS=":.*?## "}{printf "  \033[36m%-13s\033[0m %s\n", $$1, $$2}'
 	@echo ""
-	@echo "  version $(VERSION) (from pyproject.toml)   replicas $(REPLICAS)"
+	@echo "  release $(VERSION) -> DBOS version $(DBOS_VERSION) -> $(DEPLOY_NAME)   replicas $(REPLICAS)"
+	@echo "  a major bump starts a new fleet; anything else is a rolling update"
 
 .PHONY: infra
 infra: ## Create the namespace, Secret, Postgres and the RBAC the app needs
@@ -53,31 +63,40 @@ build: ## Build and load $(IMAGE) into the node's image store
 	docker save $(IMAGE) | docker exec -i $(NODE) ctr -n k8s.io images import -
 
 .PHONY: deploy
-deploy: ## Bring up this version's fleet, then point the Service at it (build first)
-	@echo ">> deployment=$(DEPLOY_NAME) image=$(IMAGE) replicas=$(REPLICAS)"
+deploy: ## Deploy $(VERSION): rolling update, or a new fleet on a major bump
+	@# Which path this takes is not a choice made here — it follows from whether
+	@# the Deployment already exists, which follows from the major version.
+	@if $(KUBECTL) get deployment $(DEPLOY_NAME) >/dev/null 2>&1; then \
+	  echo ">> ROLLING UPDATE of $(DEPLOY_NAME) to $(VERSION)"; \
+	  echo ">> same DBOS version ($(DBOS_VERSION)): new pods may run the old pods' work,"; \
+	  echo ">> so the old pods exit without draining and siblings adopt their rows"; \
+	else \
+	  echo ">> NEW FLEET $(DEPLOY_NAME) for DBOS version $(DBOS_VERSION), from $(VERSION)"; \
+	  echo ">> any older fleet keeps running until its backlog is finished"; \
+	fi
 	@mkdir -p $(RENDER_DIR)
-	@sed -e 's|__IMAGE__|$(IMAGE)|g' -e 's|__VERSION__|$(VERSION)|g' \
+	@sed -e 's|__IMAGE__|$(IMAGE)|g' -e 's|__VERSION__|$(DBOS_VERSION)|g' \
+	     -e 's|__CODE_VERSION__|$(VERSION)|g' \
 	     -e 's|__DEPLOY_NAME__|$(DEPLOY_NAME)|g' \
 	     -e 's|__REPLICAS__|$(REPLICAS)|g' k8s/30-app.yaml > $(MANIFEST)
-	@# The fleet first. Nothing is replaced — this creates a Deployment alongside
-	@# any older ones, which keep running and keep their traffic until the next
-	@# step moves it.
 	kubectl apply -f $(MANIFEST)
 	$(KUBECTL) rollout status deployment/$(DEPLOY_NAME) --timeout=300s
-	@# The cutover, once the new pods are Ready: one selector field. Older fleets
-	@# leave the endpoint list here, and carry on working on their own backlog.
-	@sed -e 's|__VERSION__|$(VERSION)|g' k8s/26-service.yaml > $(RENDER_DIR)/service.yaml
+	@# The cutover, once the new pods are Ready: one selector field, carrying the
+	@# DBOS version. A rolling update leaves it unchanged; a major bump moves it,
+	@# and older fleets leave the endpoint list while they carry on working.
+	@sed -e 's|__VERSION__|$(DBOS_VERSION)|g' k8s/26-service.yaml > $(RENDER_DIR)/service.yaml
 	kubectl apply -f $(RENDER_DIR)/service.yaml
-	@echo ">> traffic now goes to $(VERSION); older fleets work on until drained"
+	@echo ">> traffic now goes to DBOS version $(DBOS_VERSION) (code $(VERSION))"
 
 .PHONY: bump
-bump: ## Cut a new application version
-	@uv version --bump patch
-	@echo "project.version is now $$($(MAKE) --no-print-directory version)"
+bump: ## Cut a new release. PART=patch (default), minor, or major
+	@# Only PART=major starts a new DBOS version, and therefore a new fleet.
+	@uv version --bump $(or $(PART),patch)
+	@$(MAKE) --no-print-directory version
 
 .PHONY: version
-version: ## Print the project version, which is the DBOS application version
-	@echo $(VERSION)
+version: ## Print the release version and the DBOS version it maps to
+	@echo "release $(VERSION)  ->  DBOS version $(DBOS_VERSION)  ->  deployment $(DEPLOY_NAME)"
 
 .PHONY: status
 status: ## Fleets, pods, the Service target, and the dbos schema's view of the work

@@ -9,8 +9,8 @@ PENDING forever, even when the replacement runs the very same version.
 of the same version exists. :func:`cancel_stranded_versions` handles the case
 where none does.
 
-**Problem 2 — application version.** A rolling update replaces every pod at once
-with pods of a new version. Work belonging to the old version cannot run on them:
+**Problem 2 — application version.** A major bump brings up a fleet of a new
+DBOS version. Work belonging to the old version cannot run on it:
 the dequeue predicate is ``application_version == mine``
 (``_sys_db.py`` -> ``start_queued_workflows``), which is exactly the safety
 property we want — old work must not execute against new code. So nothing needs
@@ -141,9 +141,13 @@ def drain_version(version: str) -> int:
     Deliberately pure DBOS. There is no Kubernetes here, no liveness oracle and
     no orphan recovery: "does my version still own active work" is answered
     entirely by ``dbos.workflow_status``. That is what makes a safe rolling
-    deployment cheap — the whole version half of this PoC is this one query plus
-    a grace period long enough to poll it. See *Rolling deployments with new
-    versions* in the README.
+    deployment cheap — the whole version half of this PoC is this one query. See
+    *Deploying a new version* in the README.
+
+    Counts what the VERSION owns, fleet-wide, not what this pod owns. That is
+    right for a retiring version and wrong for a rolling update inside one
+    version, where it would include the replacements' work. ``shut_down()`` in
+    main.py is what keeps the two apart.
 
     Takes no namespace for the same reason it takes no API client: it does not
     need one. A caller draining on SIGTERM usually wants recovery as well, and
@@ -240,7 +244,30 @@ def cancel_stranded_versions(
     return cancelled
 
 
-def retire_drained_versions(namespace: str, me: str) -> list[str]:
+def _superseded_at_ms() -> dict[str, int]:
+    """Version -> when it stopped being latest, in epoch ms.
+
+    A version was superseded by the first version registered after it, so its
+    clock starts at that successor's registration. Using the *latest* version's
+    timestamp instead would restart an old version's clock every time a newer
+    one appeared, quietly extending its life.
+
+    The latest version is absent from the result: nothing has superseded it.
+    """
+    registered = sorted(
+        (v["version_timestamp"], v["version_name"])
+        for v in DBOS.list_application_versions()
+    )
+    return {
+        name: registered[i + 1][0]
+        for i, (_, name) in enumerate(registered)
+        if i + 1 < len(registered)
+    }
+
+
+def retire_drained_versions(
+    namespace: str, me: str, max_age_sec: float = 0.0
+) -> list[str]:
     """Delete the Deployment of every older version that owns no active work.
 
     This is what lets an old version take an hour. Each version runs in its own
@@ -289,6 +316,7 @@ def retire_drained_versions(namespace: str, me: str) -> list[str]:
         return []
 
     launched = {v["version_name"] for v in DBOS.list_application_versions()}
+    superseded = _superseded_at_ms()
 
     active_by_version: dict[str, int] = {}
     for wf in _active():
@@ -310,13 +338,36 @@ def retire_drained_versions(namespace: str, me: str) -> list[str]:
             continue
         active = active_by_version.get(version, 0)
         if active:
-            logger.info(
-                "older version still has work; its deployment stays",
+            superseded_at = superseded.get(version)
+            age_sec = (
+                (time.time() * 1000 - superseded_at) / 1000.0
+                if superseded_at is not None
+                else 0.0
+            )
+            if max_age_sec <= 0 or age_sec < max_age_sec:
+                logger.info(
+                    "older version still has work; its deployment stays",
+                    version=version,
+                    deployment=name,
+                    active=active,
+                    age_sec=round(age_sec, 1),
+                    max_age_sec=max_age_sec,
+                )
+                continue
+            # Past the deadline. Deleting the fleet still gives its pods a drain,
+            # so work that finishes inside the budget is not lost. Whatever is
+            # left becomes a stranded version, which cancel_stranded_versions
+            # cancels — one mechanism and one loud line for "work was destroyed",
+            # rather than a second cancel path here.
+            logger.warning(
+                "FORCING retirement: version coexisted past the deadline with "
+                "work still active, which will be cancelled if it cannot drain",
                 version=version,
                 deployment=name,
                 active=active,
+                age_sec=round(age_sec, 1),
+                max_age_sec=max_age_sec,
             )
-            continue
         if k8s.delete_deployment(namespace, name):
             logger.warning(
                 "retired a drained version: deleted its deployment",
@@ -352,7 +403,9 @@ def start_supervisor(s: Settings, stop: threading.Event) -> None:
             except Exception:
                 logger.exception("stranded-version sweep failed")
             try:
-                retire_drained_versions(s.pod_namespace, DBOS.application_version)
+                retire_drained_versions(
+                    s.pod_namespace, DBOS.application_version, s.retire_max_age_sec
+                )
             except Exception:
                 logger.exception("version retirement sweep failed")
 

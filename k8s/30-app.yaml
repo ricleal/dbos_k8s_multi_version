@@ -1,17 +1,22 @@
-# One Deployment for each application version.
+# One Deployment for each DBOS version — v0, v1 — not for each release.
 #
-# The name carries the version, so a deploy CREATES a fleet rather than replacing
-# one. Nothing rolls: the old Deployment is untouched and its pods stay Running.
-# They lose their API traffic when k8s/26-service.yaml moves its selector, and
-# they keep the queue pollers that let them finish the backlog they already own —
-# for an hour, if that is how long it takes.
+# The name carries the DBOS version, which is the MAJOR component of
+# project.version (see poc/config.py dbos_version). That single choice decides
+# which of two very different things a deploy does:
 #
-# There is no rollingUpdate strategy here for the same reason. A rolling update
-# is a same-Deployment concept, and this design never has two versions inside one
-# Deployment. maxSurge and maxUnavailable have nothing to govern.
+#   * 0.1.2 -> 0.1.3, or 0.1.3 -> 0.2.0. Same DBOS version, so this same object
+#     is re-applied with a new image and Kubernetes performs an ordinary rolling
+#     update. Safe without any draining: the new pods share the old pods'
+#     application_version, so they may dequeue that work directly, and orphan
+#     recovery hands them any PENDING rows. Most deploys take this path.
+#   * 0.2.0 -> 1.0.0. New DBOS version, so a NEW Deployment appears beside this
+#     one. Nothing is replaced. The old fleet keeps its pods Running, loses its
+#     API traffic when k8s/26-service.yaml moves its selector, and finishes the
+#     backlog it already owns — for an hour, if that is how long it takes.
 #
 # retire_drained_versions (poc/versions.py) deletes this object once its version
-# owns no active work. That deletion is what finally sends SIGTERM to these pods.
+# owns no active work, or once it has coexisted with a newer version past
+# retire_max_age_sec. That deletion is what finally sends SIGTERM to these pods.
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -25,6 +30,14 @@ metadata:
     version: "__VERSION__"
 spec:
   replicas: __REPLICAS__
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      # For the same-DBOS-version path only. maxUnavailable: 0 is load-bearing:
+      # a pod leaving without draining relies on a live sibling of its own
+      # version to adopt its PENDING rows, so there must always be one.
+      maxSurge: 100%
+      maxUnavailable: 0
   selector:
     matchLabels:
       app: dbos-poc
@@ -36,8 +49,12 @@ spec:
       labels:
         app: dbos-poc
         # Read by poc/k8s.py: this is how the API server answers "which executors
-        # of version X are alive". It must stay in sync with the image tag.
+        # of version X are alive". The DBOS version, so it does not churn on a
+        # patch release.
         version: "__VERSION__"
+        # Observability only, never read by any logic: which release is running
+        # inside this DBOS version.
+        code-version: "__CODE_VERSION__"
     spec:
       # The ceiling for an UNPLANNED stop only — a node drain, an eviction, or the
       # retirement delete once this version is already drained. A planned

@@ -252,12 +252,54 @@ small:
 ## Deploying a new version
 
 This is the version half of the PoC, on its own. It needs no Kubernetes API
-access, no liveness check and no orphan recovery. It needs DBOS and a
-`terminationGracePeriodSeconds` long enough to wait for the backlog. If you
-already have executor recovery from another source, such as
+access, no liveness check and no orphan recovery. If you already have executor
+recovery from another source, such as
 [Conductor](#with-and-without-conductor), this section is the part that you must
 still build.
 
+### Two kinds of deploy
+
+A DBOS version is a compatibility boundary, not a release number. It decides who
+may run a workflow, so it should change only when workflow code changes in a way
+that makes replaying an in-flight workflow unsafe. Under semver, that is a major
+bump.
+
+So the DBOS version is the **major component only**, as `v<major>`
+(`dbos_version()` in [poc/config.py](poc/config.py)):
+
+| Release | DBOS version | Deployment | What Kubernetes does |
+|---|---|---|---|
+| 0.1.2 → 0.1.3 | v0 → v0 | `dbos-poc-v0` re-applied | Rolling update, in place |
+| 0.1.3 → 0.2.0 | v0 → v0 | `dbos-poc-v0` re-applied | Rolling update, in place |
+| 0.2.0 → 1.0.0 | v0 → **v1** | `dbos-poc-v1` created | A second fleet, beside the first |
+| 1.0.0 → 1.0.1 | v1 → v1 | `dbos-poc-v1` re-applied | Rolling update, in place |
+
+Most deploys take the cheap path. Only a major bump pays for two fleets.
+
+The two paths need opposite shutdown behaviour, which is the one subtlety in the
+whole design:
+
+- **Rolling update, same DBOS version.** The replacement pods share the leaving
+  pod's `application_version`, so they may dequeue its `ENQUEUED` work directly,
+  and `recover_orphaned_workflows` hands them its `PENDING` rows within a sweep.
+  The leaving pod must therefore **not** drain. It exits at once.
+- **New fleet, new DBOS version.** No other pod in the cluster may touch the old
+  version's work. The old fleet must finish the backlog itself, and it is given
+  as long as that takes.
+
+`shut_down()` in [main.py](main.py) picks by comparing its own version with
+`get_latest_application_version()`. Getting this wrong is not a small error:
+`drain_version` counts what a *version* owns fleet-wide, so a pod draining
+during a rolling update would be waiting on work its own replacements are doing
+and creating. It would never reach zero. Every patch deploy would burn the whole
+drain budget and then report `truncated`.
+
+One caveat about the rule itself. Under semver a `0.x` minor bump may break
+anything, and this maps it to `v0` regardless, so `0.1.3 → 0.2.0` gets a rolling
+update. If your `0.x` minors are breaking, widen `dbos_version()` to include the
+minor while the major is 0.
+
+### Part of it is already free
 ### Part of it is already free
 
 `start_queued_workflows` dequeues with `application_version == mine`, plus NULL
@@ -306,7 +348,7 @@ wait for, because waiting costs nothing but a Deployment.
 ### How a version retires
 
 ```python
-retire_drained_versions(namespace, me) -> list[str]
+retire_drained_versions(namespace, me, max_age_sec) -> list[str]
 ```
 
 The latest version's pods delete the Deployment and the PodDisruptionBudget of
@@ -323,7 +365,7 @@ Four guards, each covering a way this could destroy work:
    Deployment, no pods and no work, while the outgoing version is still
    `latest`. Without this guard the old fleet deletes the new one on sight —
    measured at 4 seconds after a deploy, before the new pods had finished
-   starting. "Has no work" and "has not started yet" look identical in the
+   starting. "Has no work" and "has not started yet" are identical in the
    database, and only the registry separates them.
 3. **Only versions with zero active work**, counted by the same query the drain
    uses, so "drained" means one thing in this codebase.
@@ -332,9 +374,40 @@ Four guards, each covering a way this could destroy work:
    as "no deployments" and retiring every version.
 
 Three pods run this at once. Deleting a Deployment is idempotent enough for
-that: the loser of the race gets a 404, which is treated as success by someone
-else, not as an error.
+that: the loser of the race gets a 404, which is treated as "someone else did
+it", not as an error.
 
+### The 24-hour deadline
+
+Guard 3 has no upper bound on its own. A version with a stuck workflow, or one
+in a long durable sleep, would keep its fleet forever. So there is a hard limit
+on how long two DBOS versions may coexist: `retire_max_age_sec`, 24 hours by
+default. Past it, the fleet is retired whether or not it has drained.
+
+**This can destroy work, and it is the only setting here that can.** At the
+deadline the fleet is deleted, its pods receive SIGTERM, and they drain — so work
+that finishes inside the drain budget is still safe. Anything longer is left on a
+version with no pods, which `cancel_stranded_versions` then cancels. That routing
+is deliberate: one mechanism and one loud log line for "work was destroyed",
+rather than a second cancel path here.
+
+The clock starts when the version **stopped being latest**, which is the
+registration timestamp of the first version newer than it, read from
+`dbos.application_versions`. Two things it deliberately is not:
+
+- **Not the Deployment's `creationTimestamp`.** That object is re-applied on
+  every patch release, and `creationTimestamp` is immutable, so it reports the
+  age of the first deploy of that major version — potentially months.
+- **Not an in-memory timer.** A pod restart cannot extend anyone's 24 hours.
+  (The stranded-version timer *is* in memory, which is why it appears under
+  [Known limitations](#known-limitations) and this does not.)
+
+With three or more versions alive, each old one is measured from when it was
+superseded, not from the newest deploy. Otherwise a third deploy would silently
+extend the first version's life.
+
+Set `retire_max_age_sec` to 0 to disable the deadline and let a version live
+until it drains.
 ### The five requirements on Kubernetes
 
 **1. The version travels with the image.** `application_version` comes from
@@ -435,38 +508,61 @@ like every time.
 ### What a deploy does
 
 ```bash
-make bump && make build && make deploy
+make bump && make build && make deploy     # patch: rolling update
+make bump PART=major && make build && make deploy   # new fleet
 ```
 
-Four steps, in this order:
+`make deploy` announces which path it took, because the two look nothing alike
+in `make status` and it is worth knowing which one to expect.
 
-1. A new Deployment appears, named for the new version. Nothing is replaced. The
-   old fleet is untouched and keeps serving requests.
+**Rolling update** (`0.1.15 → 0.1.16`, both `v0`). The same Deployment is
+re-applied with the new image, and Kubernetes replaces the pods. Old pods exit
+without draining. Measured on this cluster:
+
+```
+>> ROLLING UPDATE of dbos-poc-v0 to 0.1.16
+>> same DBOS version (v0): new pods may run the old pods' work,
+>> so the old pods exit without draining and siblings adopt their rows
+```
+
+The old pods were gone within seconds, and the three new v0 pods adopted their
+rows immediately:
+
+```
+13:42:20  recovered workflows from executors with no pod
+              executors=[...-89tl4, ...-96jxc, ...-wnbnk] recovered=5
+13:42:20  recovered workflows ... recovered=4
+13:42:20  recovered workflows ... recovered=1
+```
+
+All 66 workflows across the two releases finished `SUCCESS`. Nothing was
+cancelled, and no drain ran.
+
+**New fleet** (`0.2.0 → 1.0.0`, `v0 → v1`). Four steps:
+
+1. A new Deployment appears, named for the new DBOS version. Nothing is
+   replaced, and the old fleet keeps serving requests.
 2. The new pods reach `Ready`.
-3. The Service selector moves to the new version. From here, every request goes
-   to the new fleet, and `POST /work` can only create new-version work.
+3. The Service selector moves to the new DBOS version. Every request now goes to
+   the new fleet, and `POST /work` can only create new-version work.
 4. The old fleet keeps running. It is not `Terminating`, and nothing counts down
-   against it. It holds its worker slots and finishes the backlog it already
-   owns.
+   against it. It holds its worker slots and finishes the backlog it owns.
 
-Then, on a later sweep, the new version's pods find that the old version owns
-nothing and delete its Deployment and budget. That deletion sends the old pods
-their first and only SIGTERM, and their drain finds nothing to wait for.
-
-Measured on this cluster, deploying 0.1.15 while 0.1.14 was busy:
+Then, on a later sweep, the new version's pods find the old version empty and
+delete its Deployment and budget. That deletion sends the old pods their first
+and only SIGTERM, and their drain finds nothing to wait for. Measured:
 
 ```
-14:01:33  deploy: traffic now goes to 0.1.15
-          0.1.14 pods: Running (not Terminating), 6 workflows still active
-14:01:40  0.1.15 pods log: "older version still has work; its deployment stays"
-                            version=0.1.14 active=3
-14:01:45  0.1.15 pod logs:  "retired a drained version: deleted its deployment"
-                            version=0.1.14
-14:02:06  0.1.14 fleet gone. All 33 of its workflows SUCCESS
+09:45:25  NEW FLEET dbos-poc-v1 for DBOS version v1, from 1.0.0
+          both fleets Running; v0 holds 6 active workflows
+13:45:42  older version still has work; its deployment stays
+              version=v0 active=6 age_sec=10.4 max_age_sec=86400.0
+13:45:52  retired a drained version: deleted its deployment  version=v0
+09:45:57  v0 fleet gone. All 33 of its workflows SUCCESS
 ```
 
-Every 0.1.14 workflow finished on a 0.1.14 pod. **No workflow crossed between
-versions**, and no grace period was involved.
+Every v0 workflow finished on a v0 pod. Nothing crossed between versions, and no
+grace period was involved.
 
 ### When the budget expires
 
@@ -477,11 +573,13 @@ pods, and that is the exact condition that `cancel_stranded_versions` detects.
 The system cancels incomplete work with a warning. It does not abandon the work
 silently.
 
-One conservative edge case: `drain_version` waits until the version is empty
-across the whole fleet. That is correct for a version upgrade. It is strict for
-a restart of the same version. A change to configuration alone keeps the version
-string the same. The retiring pods then wait for work that their own
-replacements create.
+`drain_version` waits until the version is empty across the whole fleet. That is
+correct for a version upgrade, and wrong for a rolling update inside one
+version, where it would count work the replacement pods are doing. This is why
+`shut_down()` drains only when this pod's version is no longer the latest — see
+[Two kinds of deploy](#two-kinds-of-deploy). A pod leaving during a rolling
+update exits at once and lets its siblings adopt its work, so it never reaches
+this ceiling.
 
 ## Running it
 
@@ -493,15 +591,19 @@ make infra && make build && make deploy
 make status
 ```
 
-To cut a new version and deploy it:
+To cut a new release and deploy it:
 
 ```bash
-make bump && make build && make deploy
+make bump && make build && make deploy               # patch: rolling update
+make bump PART=minor && make build && make deploy    # minor: rolling update
+make bump PART=major && make build && make deploy    # major: a new fleet
 ```
 
-`make bump` edits `project.version` in `pyproject.toml`. That value **is** the
-application version. See
-[requirement 1](#the-five-requirements-on-kubernetes).
+`make bump` edits `project.version` in `pyproject.toml`, which is the only place
+a version is defined. The DBOS version is its major component, so only
+`PART=major` starts a new fleet — see
+[Two kinds of deploy](#two-kinds-of-deploy). `make version` prints both, and
+`make deploy` says which path it is taking before it takes it.
 
 ### Makefile targets
 
@@ -510,12 +612,12 @@ application version. See
 | `make help` | Lists the targets and prints the current version and replica count. This is the default goal. |
 | `make infra` | Creates the namespace, the credentials Secret, the Postgres StatefulSet, and the RBAC that the app needs (`get` and `list` on pods). Waits until Postgres is ready. |
 | `make build` | Builds the image as `dbos-poc:$(VERSION)`, then imports it into the containerd store of the node. The Kubernetes node of Docker Desktop has its own image store, which is the reason `imagePullPolicy: Never` works. |
-| `make deploy` | Renders `k8s/30-app.yaml` into `.rendered/app-$(VERSION).yaml` and applies it. It does not build. It returns immediately, and the old pods continue to drain. |
-| `make bump` | Increases the patch version in `pyproject.toml`. This is the only definition of the application version. |
-| `make version` | Prints the project version, which is the DBOS application version. |
+| `make deploy` | Renders `k8s/30-app.yaml` into `.rendered/app-$(VERSION).yaml`, applies it, waits for the pods to be `Ready`, then moves the Service selector. It does not build. Prints whether this is a rolling update or a new fleet. |
+| `make bump` | Increases the version in `pyproject.toml`, the only definition of a version. `PART=patch` by default, or `minor`, or `major`. Only `major` changes the DBOS version, and therefore only `major` creates a fleet. |
+| `make version` | Prints the release, the DBOS version it maps to, and the Deployment that implies. |
 | `make status` | Prints the pods with their `version` label, then the work counted by version and status from `dbos.workflow_status`. This is the reference for every result below. |
 | `make logs` | Follows every app pod. It attaches to the pods that exist when it starts, so it exits after a rollout replaces them. Run it again. |
-| `make kill_version VER=x.y.z` | Stops every app container of that version through the CRI of the node. This models the loss of a machine: no SIGTERM, no drain, and no pod object. The demo uses it to strand a version. |
+| `make kill_version VER=v0` | Stops every app container of that DBOS version through the CRI of the node, with no SIGTERM and no drain. It cannot strand a version on its own, because the version's Deployment restarts what it kills — see [Scenario 1.2](#scenario-12--a-version-with-no-pods). |
 | `make dbos_reset` | Drops the DBOS system database with `dbos reset`, inside a live app pod. It needs a running Deployment, and it reports the problem if there is none. |
 | `make reset` | Runs `dbos_reset`, then deletes the Deployment and its old ReplicaSets. It keeps Postgres and its volume, so the next deploy starts with an empty database. |
 | `make clean` | Deletes the whole namespace, including the Postgres volume, and removes `.rendered/`. |
@@ -523,8 +625,8 @@ application version. See
 You can override these variables: `REPLICAS` (default 3), `NS` (default
 `dbos-poc`), `NODE` (default `desktop-control-plane`, the node container of
 Docker Desktop), and `VERSION`. `VERSION` normally comes from `pyproject.toml`.
-`make deploy VERSION=0.1.7` deploys an image that you built earlier. The demo
-uses this to deploy an old version first and then move forward to a new one.
+`VERSION` is derived from `pyproject.toml` and is not meant to be overridden.
+`make bump` is how it changes.
 
 ### Credentials
 
@@ -583,9 +685,9 @@ Then cut and build a second version, so that both images are in the store of the
 node before the test starts:
 
 ```bash
-make version        # for example 0.1.7 — record this as the OLD version
-make bump && make build
-make version        # for example 0.1.8 — the NEW version
+make version        # for example 0.2.0 -> DBOS version v0 — the OLD version
+make bump PART=major && make build
+make version        # for example 1.0.0 -> DBOS version v1 — the NEW version
 ```
 
 Build both versions first. `make build` takes about one minute, mostly to import
@@ -717,14 +819,19 @@ Two commands do stop a pod. The scenarios below use one each:
 | Pod state | Command | Effect |
 |---|---|---|
 | **Live** | `kubectl delete pod <name> --grace-period=1` | Sends SIGTERM, then SIGKILL one second later. The process stops, the pod object goes, and the ReplicaSet starts a replacement. Scenario 1.1 uses this. |
-| **Terminating** | `make kill_version VER=x.y.z` | Stops the container through the CRI of the node, from outside the PID namespace of the pod. There is no SIGTERM and no drain. Scenario 1.2 uses this. |
+| **Terminating** | `make kill_version VER=v0` | Stops the container through the CRI of the node, from outside the PID namespace of the pod. There is no SIGTERM and no drain. |
+
+`kill_version` takes a DBOS version (`v0`), because that is what the pod labels
+carry. Note that it can no longer strand a version on its own: every version now
+owns a Deployment, so the kubelet restarts whatever it kills. Scenario 1.2
+explains what replaced it.
 
 ### Scenario 1.1 — a pod stops, siblings are alive
 
 Reset and start one version:
 
 ```bash
-make reset && make deploy
+make reset && make build && make deploy
 ```
 
 When terminal 1 shows a backlog, stop one pod with a short grace period. Do not
@@ -739,84 +846,131 @@ will not touch them, because its own recovery matches only the executor id that
 started the process. Within one sweep of five seconds, a sibling adopts them:
 
 ```
-recovered workflows from executors with no pod
-    version=0.1.8 executors=['dbos-poc-759746fb7-2sgng'] recovered=3
+13:17:29  recovered workflows from executors with no pod
+              version=v0 executors=['dbos-poc-v0-7c65bbdfb7-8h2hj'] recovered=2
 ```
 
-This appeared one second after the delete. Exactly one pod logs it. The
-recovered workflows continue from their last complete step. They do not start
-again, because the rows are re-enqueued in place with the same workflow id, so
-the checkpoints in `operation_outputs` still apply.
+Measured one second after the delete. Exactly one pod logs it. The recovered
+workflows continue from their last complete step. They do not start again: the
+rows are re-enqueued in place with the same workflow id, so the checkpoints in
+`operation_outputs` still apply.
 
-Every workflow reaches `SUCCESS`. The system cancels nothing and leaves nothing
-behind:
+The version's own Deployment then starts a replacement pod, under a new random
+name and therefore a new executor id. Nothing links it to the dead pod's rows,
+which is exactly why `recover_orphaned_workflows` has to exist.
+
+Everything reaches `SUCCESS`, with nothing cancelled and nothing left behind.
+The replacement pod also starts a parent workflow of its own, so the total is
+higher than the backlog you started with.
+
+**The same mechanism carries a rolling update.** A patch deploy replaces all
+three pods, and none of them drains — see
+[Two kinds of deploy](#two-kinds-of-deploy). Their `PENDING` rows are adopted by
+the new pods of the same version, in exactly the way this scenario shows, only
+three times at once:
 
 ```
- status  | count            executor_id        | count
----------+-------   --------------------------+-------
- SUCCESS |    64     dbos-poc-759746fb7-4bg7d |    21
-                     dbos-poc-759746fb7-b29tf |    21
-                     dbos-poc-759746fb7-l9kfh |    22
+13:42:20  recovered workflows from executors with no pod
+              executors=[...-89tl4, ...-96jxc, ...-wnbnk] recovered=5
+13:42:20  recovered workflows ... recovered=4
+13:42:20  recovered workflows ... recovered=1
 ```
 
-The total is 64, not 48, because the ReplicaSet started a replacement pod
-(`b29tf`), and that pod started a parent workflow of its own. The 12 rows of the
-stopped pod are absent from the executor list. Its three `PENDING` workflows
-moved to `l9kfh`, which is the reason that pod completed 22.
+All 66 workflows across the two releases finished `SUCCESS`. This is why a
+same-version rollout can skip the drain: orphan recovery already covers it.
 
 ### Scenario 1.2 — a version with no pods
 
-This scenario needs the processes of the old version to stop completely, which
-is the purpose of `make kill_version`. See [How to stop a pod](#how-to-stop-a-pod).
+A version with active work and no pods cannot be rescued by anything in the
+cluster: only a pod of that version may dequeue or recover its work. This is the
+case `cancel_stranded_versions` exists to find.
+
+**One Deployment for each version makes this state much harder to reach**, which
+is worth stating before the recipe. Under the previous single-Deployment design,
+`make kill_version` was enough: the old pods were `Terminating`, so nothing
+replaced them. Now each version owns a Deployment, and that Deployment restarts
+whatever you kill:
+
+- Kill the containers and the kubelet restarts them **in the same pods**, under
+  the same names and therefore the same executor ids. That is the ordinary crash
+  case, which DBOS's own startup recovery already handles.
+- Delete the pods and the ReplicaSet creates replacements of the same version,
+  which adopt the work through `recover_orphaned_workflows`.
+
+To strand a version you now have to remove its *fleet*, not its pods. Two ways
+in, and the first is the one the system takes on its own.
+
+#### By the deadline
+
+The 24-hour limit does exactly this when a version will not drain. Shorten it so
+the deadline arrives in a minute, then deploy over a version that has more work
+than it can finish:
 
 ```bash
-make reset
-make deploy VERSION=0.1.7           # the OLD version
-# wait for a backlog in terminal 1
-make deploy                         # move forward to 0.1.8
-make kill_version VER=0.1.7         # as soon as the old pods become Terminating
+# on the incoming fleet, so it enforces a short deadline and a short wait
+kubectl -n dbos-poc set env deployment/dbos-poc-v3 \
+    RETIRE_MAX_AGE_SEC=60 STRANDED_GRACE_SEC=45
 ```
 
-Run the last two commands one after the other. `kill_version` has an effect only
-while the old pods are `Terminating`. On a live pod, the kubelet restarts the
-container under the same pod name, and therefore under the same executor id.
-That is the crash case that DBOS already handles.
-
-Version 0.1.7 now has 48 active workflows and no pods. No process in the cluster
-can complete them, because only a pod of that version can dequeue or recover its
-work. The new pods detect this within one sweep and start to wait. They log once
-for each tick:
+Recorded on this cluster, with v2 holding 33 active workflows when v3 arrived.
+The countdown runs first, once for each sweep:
 
 ```
-version has active work but no pods; waiting for one to appear
-    version=0.1.7 active=48 waited_sec=141.9 grace_sec=300.0
-    version=0.1.7 active=48 waited_sec=233.1 grace_sec=300.0
-    version=0.1.7 active=48 waited_sec=293.9 grace_sec=300.0
+13:49:50  older version still has work; its deployment stays
+              version=v2 active=40 age_sec=44.4 max_age_sec=60.0
+13:50:01  older version still has work ... active=36 age_sec=54.7
+13:50:06  older version still has work ... active=35 age_sec=59.8
 ```
 
-The `active` count stays at 48, because no process runs that work. That is the
-condition under detection. The increase of `waited_sec` is the demonstration:
-the system does not cancel at the first missing pod, because a pod that is
-restarting or moving to another node must have the opportunity to return.
-
-After `stranded_grace_sec`, which is 300s by default, the system cancels the
-work:
+Then the deadline passes and the fleet goes, work or no work:
 
 ```
-CANCELLED stranded workflows: no pod of this version ever appeared
-    version=0.1.7 cancelled=48 waited_sec=304.0
+13:50:11  FORCING retirement: version coexisted past the deadline with work
+          still active, which will be cancelled if it cannot drain
+              version=v2 active=33 age_sec=64.8 max_age_sec=60.0
 ```
 
+Deleting the fleet sends its pods SIGTERM, so they drain — work that fits inside
+the drain budget still finishes. The rest is now on a version with no pods. The
+new fleet notices within a sweep and starts waiting, because a pod that is
+restarting or moving to another node deserves the chance to come back:
+
 ```
- application_version |  status   | count
----------------------+-----------+-------
- 0.1.7               | CANCELLED |    48
- 0.1.8               | SUCCESS   |    48
+13:52:39  CANCELLED stranded workflows: no pod of this version ever appeared
+              version=v2 cancelled=30 waited_sec=45.8 grace_sec=45.0
 ```
 
-Two of the three observers logged that cancel in the same tick, and the total is
-48, not 96. The cancel is an idempotent status update with no version filter, so
-observers can race safely, and no leader election is necessary.
+Final state: of v2's 99 workflows, 69 finished and 30 were cancelled, loudly.
+
+```
+ version |  status   | count
+---------+-----------+-------
+ v2      | CANCELLED |    30
+ v2      | SUCCESS   |    69
+```
+
+The cancel is an idempotent status update with no version filter, so several
+observers may run it in the same tick without double-counting, and no leader
+election is needed.
+
+#### By removing the fleet by hand
+
+The same state, reached deliberately. Deploy a newer version first, so something
+is left alive to observe the stranding, then take the old fleet away while it
+still has work:
+
+```bash
+kubectl -n dbos-poc scale deployment/dbos-poc-v3 --replicas=0
+# or, to remove the fleet outright:
+kubectl -n dbos-poc delete deployment dbos-poc-v3
+```
+
+Either way the pods receive SIGTERM and drain, and whatever exceeds the drain
+budget is left stranded and then cancelled, exactly as above.
+
+The output for this route is not recorded here: both commands are destructive
+enough that the environment these notes were written in refuses them. The
+deadline route above produces the identical condition and is recorded in full.
 
 ### Clean up
 

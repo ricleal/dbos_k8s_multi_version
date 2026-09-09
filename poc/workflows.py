@@ -7,7 +7,7 @@ import time
 from dbos import DBOS, DBOSConfig, SetWorkflowID
 
 from poc import logs
-from poc.config import Settings, project_version
+from poc.config import Settings, dbos_version, project_version
 
 logger = logs.get_logger("poc")
 
@@ -40,9 +40,12 @@ def init_dbos(s: Settings) -> None:
         "name": "dbos-k8s-multi-version",
         "system_database_url": s.dbos_system_database_url.unicode_string(),
         "log_level": s.log_level,
+        # The MAJOR component only, as v<major> — see dbos_version(). A patch
+        # or minor release keeps the same DBOS version, so its deploy is an
+        # ordinary rolling update and the new pods may run the old pods' work.
         # From pyproject.toml, never from the environment: the version has to
         # travel with the code it describes.
-        "application_version": project_version(),
+        "application_version": dbos_version(),
     }
 
     DBOS(config=config)

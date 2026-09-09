@@ -25,6 +25,32 @@ def project_version() -> str:
         return tomllib.load(f)["project"]["version"]
 
 
+def dbos_version() -> str:
+    """The DBOS application version: the major component only, as ``v<major>``.
+
+    A DBOS version is a compatibility boundary, not a release number. It decides
+    who may run a workflow, so it should change only when workflow code changes
+    in a way that makes replaying an in-flight workflow unsafe. Under semver
+    that is a major bump.
+
+    So 0.1.2, 0.1.3 and 0.2.0 are all ``v0``, and 1.0.0 and 1.0.1 are both
+    ``v1``. The consequence is the whole point:
+
+    * Same DBOS version -> the same Deployment is re-applied, and Kubernetes
+      performs an ordinary rolling update. New pods may dequeue and recover the
+      old pods' work, because it carries their own version.
+    * New DBOS version -> a new Deployment beside the old one, which keeps
+      working until its backlog is finished.
+
+    Most deploys take the cheap path. Only a major bump pays for two fleets.
+
+    CAVEAT: under semver, a 0.x minor bump may break anything, and this rule
+    maps it to v0 anyway. If your 0.x minors are breaking, widen this to include
+    the minor while major is 0.
+    """
+    return "v" + project_version().split(".")[0]
+
+
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")
 
@@ -44,6 +70,26 @@ class Settings(BaseSettings):
 
     sweep_interval_sec: float = 5.0
     """How often the supervisor checks for orphaned and stranded work."""
+
+    retire_max_age_sec: float = 86400.0
+    """Hard limit on how long two DBOS versions may coexist. 24 hours.
+
+    A version normally retires the moment it owns no work, which is usually
+    seconds after the deploy. This is the backstop for the version that never
+    drains — a stuck workflow, or one in a long durable sleep.
+
+    Measured from when the version stopped being latest, which is the
+    registration timestamp of the first version newer than it, read from
+    ``dbos.application_versions``. Deliberately not the Deployment's
+    creationTimestamp: that object is re-applied on every patch release and its
+    creationTimestamp is immutable, so it reports the age of the first deploy of
+    that major version, which can be months. Deliberately not an in-memory
+    timer either, so a pod restart cannot extend anyone's 24 hours.
+
+    THIS CAN DESTROY WORK. At the deadline the fleet is deleted, its pods get
+    SIGTERM, and whatever does not finish inside the drain budget is left
+    stranded and then cancelled by cancel_stranded_versions. Set 0 to disable
+    the deadline and let a version live until it drains."""
 
     stranded_grace_sec: float = 300.0
     """How long a version may have active work and no pods before that work is
