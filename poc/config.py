@@ -73,7 +73,14 @@ class Settings(BaseSettings):
     """Port the API listens on. The Service targets it by name, not by number."""
 
     parents_on_launch: int = 1
-    """Parent workflows this pod starts at launch. 0 makes it a pure worker."""
+    """Parent workflows this pod starts at launch. 0 makes it a pure worker.
+
+    Interacts with the autoscaler, and not innocently: every replica KEDA adds
+    starts a parent, which enqueues `children` more workflows, which raises the
+    depth KEDA scales on. The loop is bounded by max_replicas and converges, but
+    it is a loop. Measured: 47 parents over one fleet's life against a ceiling of
+    10 pods. A real autoscaled app should set this to 0 and take its work from
+    the outside."""
 
     worker_concurrency: int = 2
     log_level: str = "DEBUG"

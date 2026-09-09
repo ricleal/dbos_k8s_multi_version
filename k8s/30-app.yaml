@@ -30,7 +30,10 @@ metadata:
     # its pods exist.
     version: "__VERSION__"
 spec:
-  replicas: __REPLICAS__
+  # No replicas field. The ScaledObject at the bottom of this file owns the
+  # replica count, and a value here would fight it: every `kubectl apply` would
+  # reset the count and KEDA would move it back on its next poll. Kubernetes
+  # defaults a new Deployment to 1, and KEDA takes it from there.
   strategy:
     type: RollingUpdate
     rollingUpdate:
@@ -182,3 +185,99 @@ spec:
     matchLabels:
       app: dbos-poc
       version: "__VERSION__"
+---
+# A second Service, for this version only, and the reason it has to exist.
+#
+# k8s/26-service.yaml is the cutover: its selector names one version, and a
+# deploy moves it. That makes it useless to KEDA. An old fleet still needs
+# scaling while it works through its backlog, and the cutover Service no longer
+# resolves to it — polling that Service would report the NEW version's depth and
+# scale the old fleet by it.
+#
+# So each fleet gets a stable address of its own, named after the fleet. Only
+# KEDA uses it. Callers keep using the cutover Service, which is what makes an
+# old version invisible to traffic and still visible to its autoscaler.
+apiVersion: v1
+kind: Service
+metadata:
+  name: __DEPLOY_NAME__
+  namespace: dbos-poc
+  labels:
+    app: dbos-poc
+    version: "__VERSION__"
+spec:
+  selector:
+    app: dbos-poc
+    version: "__VERSION__"
+  ports:
+    - name: http
+      port: 80
+      targetPort: http
+---
+# Autoscaling on queue depth, the pattern DBOS documents for Kubernetes:
+# https://docs.dbos.dev/production/hosting-with-kubernetes#scaling-with-keda
+#
+# KEDA polls the app's own /metrics/{queue} endpoint through the Service above
+# and reads one JSON field. No Prometheus and no OpenTelemetry are involved:
+# DBOS exports no metrics over OTLP, so an app endpoint is both the documented
+# route and the shortest one. KEDA computes
+#
+#   desiredReplicas = ceil(queue_length / targetValue)
+#
+# and drives a HorizontalPodAutoscaler it creates and owns.
+#
+# The endpoint reports the depth of THIS version only — see queue_depth() in
+# poc/server.py. That is the one change this per-version design forces on the
+# DBOS recipe, and without it each fleet would scale on the other's work.
+apiVersion: keda.sh/v1alpha1
+kind: ScaledObject
+metadata:
+  name: __DEPLOY_NAME__
+  namespace: dbos-poc
+  labels:
+    app: dbos-poc
+    version: "__VERSION__"
+spec:
+  scaleTargetRef:
+    name: __DEPLOY_NAME__
+  # How often KEDA calls the endpoint. It governs the 0 -> 1 decision on its
+  # own; from 1 upwards the HPA below drives, on its own 15s sync.
+  pollingInterval: 15
+  # No cooldownPeriod, deliberately, though the DBOS example sets one. It
+  # applies ONLY to scaling back to zero, and minReplicaCount is 1 here, so the
+  # field would be dead configuration that reads like a scale-down control.
+  # The real scale-down control is the stabilization window under `advanced`.
+  #
+  # NEVER 0, even though KEDA supports it and an idle fleet would be cheaper.
+  # Scaling counts ENQUEUED and PENDING work but not DELAYED, so a fleet holding
+  # only a sleeping workflow would scale to zero and have no pod to wake it —
+  # while `make retire` would refuse to remove the fleet, because DELAYED *is*
+  # active work. The fleet would sit at zero until the 24-hour deadline. One pod
+  # is the floor; retirement is what removes the last one.
+  minReplicaCount: __MIN_REPLICAS__
+  maxReplicaCount: __MAX_REPLICAS__
+  advanced:
+    horizontalPodAutoscalerConfig:
+      behavior:
+        # Kubernetes defaults this window to 300s, so without this block a fleet
+        # that emptied keeps all its pods for five minutes. Measured here: depth
+        # reached 0 and the fleet was still at its ceiling of 10 a minute later.
+        #
+        # 60s instead. Long enough that a lull between bursts does not cost a
+        # round of pod churn — every scale-down replays the step in progress on
+        # another pod — and short enough that the fleet is elastic, which is the
+        # only reason to autoscale it at all.
+        #
+        # Scale-UP is left at the Kubernetes default, which is immediate. A
+        # backlog is a queue of work already accepted, so there is nothing to
+        # gain by damping the response to it.
+        scaleDown:
+          stabilizationWindowSeconds: 60
+  triggers:
+    - type: metrics-api
+      metadata:
+        url: "http://__DEPLOY_NAME__.dbos-poc.svc.cluster.local/metrics/__QUEUE_NAME__"
+        valueLocation: "queue_length"
+        # Match worker_concurrency: one replica per targetValue queued
+        # workflows is exactly one replica per worker slot.
+        targetValue: "__TARGET_VALUE__"

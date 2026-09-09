@@ -15,8 +15,30 @@ SHELL := /bin/bash
 VERSION      := $(shell python3 -c "import tomllib;print(tomllib.load(open('pyproject.toml','rb'))['project']['version'])")
 DBOS_VERSION := v$(word 1,$(subst ., ,$(VERSION)))
 NS           := dbos-poc
-REPLICAS     := 3
 IMAGE        := dbos-poc:$(VERSION)
+
+# Replicas are KEDA's business now, so this is a floor and a ceiling rather than
+# a count. See the ScaledObject in k8s/30-app.yaml.
+#
+#   MIN_REPLICAS  never 0. A fleet at zero cannot wake its own DELAYED work, and
+#                 retirement — not the autoscaler — removes the last pod.
+#   TARGET_VALUE  must equal worker_concurrency in poc/config.py. KEDA scales to
+#                 ceil(queue_length / TARGET_VALUE), so this is "queued
+#                 workflows one pod can hold", and any other value makes the
+#                 autoscaler aim at a fleet that is too small or too idle.
+MIN_REPLICAS  := 1
+MAX_REPLICAS  := 10
+TARGET_VALUE  := 2
+
+# The queue KEDA watches. Matches QUEUE_NAME in poc/workflows.py, and `make
+# deploy` proves the rendered URL answers rather than trusting that it does.
+QUEUE_NAME := poc_queue
+
+# Pinned, because an autoscaler that arrives by `latest` is an autoscaler that
+# changes behaviour on a Tuesday. KEDA is cluster-wide and outlives the
+# namespace, so `make clean` leaves it installed; `make keda_uninstall` removes it.
+KEDA_VERSION := 2.20.2
+KEDA_MANIFEST := https://github.com/kedacore/keda/releases/download/v$(KEDA_VERSION)/keda-$(KEDA_VERSION).yaml
 
 # Docker Desktop runs Kubernetes on a kind-style node with its own image store.
 # The node container is hidden from `docker ps`, but `docker exec` reaches it.
@@ -90,17 +112,41 @@ help: ## Show this help
 	@grep -hE '^[a-zA-Z_-]+:.*?## ' $(MAKEFILE_LIST) | \
 	  awk 'BEGIN{FS=":.*?## "}{printf "  \033[36m%-13s\033[0m %s\n", $$1, $$2}'
 	@echo ""
-	@echo "  release $(VERSION) -> DBOS version $(DBOS_VERSION) -> $(DEPLOY_NAME)   replicas $(REPLICAS)"
+	@echo "  release $(VERSION) -> DBOS version $(DBOS_VERSION) -> $(DEPLOY_NAME)"
+	@echo "  replicas $(MIN_REPLICAS)-$(MAX_REPLICAS), KEDA scales on ceil(queue_length/$(TARGET_VALUE))"
 	@echo "  a major bump starts a new fleet; anything else is a rolling update"
 
 .PHONY: infra
-infra: ## Create the namespace, Secret, Postgres and the RBAC the app needs
+infra: keda ## Install KEDA, then the namespace, Secret, Postgres and RBAC
 	@kubectl get nodes >/dev/null || { echo "cluster unreachable"; exit 1; }
 	kubectl apply -f k8s/00-namespace.yaml
 	kubectl apply -f k8s/05-secret.yaml
 	kubectl apply -f k8s/10-postgres.yaml
 	kubectl apply -f k8s/20-rbac.yaml
 	$(KUBECTL) rollout status statefulset/postgres --timeout=180s
+
+.PHONY: keda
+keda: ## Install KEDA $(KEDA_VERSION) cluster-wide, or report that it is present
+	@# Cluster-wide and namespace-independent, so this is idempotent and cheap to
+	@# re-run. The CRDs have to exist before any ScaledObject is applied, which is
+	@# why `infra` depends on this and not on `deploy`.
+	@if kubectl get crd scaledobjects.keda.sh >/dev/null 2>&1; then \
+	  echo ">> KEDA already installed: $$(kubectl -n keda get deployment keda-operator \
+	      -o jsonpath='{.spec.template.spec.containers[0].image}' 2>/dev/null)"; \
+	else \
+	  echo ">> installing KEDA $(KEDA_VERSION)"; \
+	  kubectl apply --server-side -f $(KEDA_MANIFEST); \
+	  for d in keda-operator keda-metrics-apiserver keda-admission; do \
+	    kubectl -n keda rollout status deployment/$$d --timeout=300s; \
+	  done; \
+	fi
+
+.PHONY: keda_uninstall
+keda_uninstall: ## Remove KEDA from the cluster, including its CRDs
+	@# Deleting the CRDs deletes every ScaledObject with them, which leaves the
+	@# Deployments at whatever replica count they last held. Nothing scales after
+	@# this, and nothing else breaks.
+	-kubectl delete -f $(KEDA_MANIFEST) --ignore-not-found
 
 .PHONY: build
 build: ## Build and load $(IMAGE) into the node's image store
@@ -123,9 +169,33 @@ deploy: ## Deploy $(VERSION): rolling update, or a new fleet on a major bump
 	@sed -e 's|__IMAGE__|$(IMAGE)|g' -e 's|__VERSION__|$(DBOS_VERSION)|g' \
 	     -e 's|__CODE_VERSION__|$(VERSION)|g' \
 	     -e 's|__DEPLOY_NAME__|$(DEPLOY_NAME)|g' \
-	     -e 's|__REPLICAS__|$(REPLICAS)|g' k8s/30-app.yaml > $(MANIFEST)
+	     -e 's|__MIN_REPLICAS__|$(MIN_REPLICAS)|g' \
+	     -e 's|__MAX_REPLICAS__|$(MAX_REPLICAS)|g' \
+	     -e 's|__TARGET_VALUE__|$(TARGET_VALUE)|g' \
+	     -e 's|__QUEUE_NAME__|$(QUEUE_NAME)|g' k8s/30-app.yaml > $(MANIFEST)
+	@grep -q '__[A-Z_]*__' $(MANIFEST) && { echo "unsubstituted placeholder in $(MANIFEST)"; \
+	  grep -o '__[A-Z_]*__' $(MANIFEST) | sort -u; exit 1; } || true
 	kubectl apply -f $(MANIFEST)
 	$(KUBECTL) rollout status deployment/$(DEPLOY_NAME) --timeout=300s
+	@# Prove the URL KEDA is about to poll, rather than assume it. A wrong queue
+	@# name would not fail loudly: the endpoint would answer 0 for a queue nobody
+	@# uses, the fleet would sit at MIN_REPLICAS, and nothing would look broken.
+	@#
+	@# Retried, because `rollout status` returning is not the same as the API
+	@# listening. There is no readiness probe — see k8s/30-app.yaml — so a pod is
+	@# Ready as soon as its container starts, several seconds before DBOS has
+	@# launched and uvicorn has bound the port.
+	@echo -n ">> KEDA will poll $(DEPLOY_NAME)/metrics/$(QUEUE_NAME) -> "
+	@for i in $$(seq 30); do \
+	  if $(call in_pod,print(urlopen('http://$(DEPLOY_NAME)/metrics/$(QUEUE_NAME)').read().decode())) \
+	       2>/dev/null | grep -q '"queue_name": *"$(QUEUE_NAME)"'; then \
+	    echo "answers for queue $(QUEUE_NAME)"; exit 0; \
+	  fi; \
+	  sleep 2; \
+	done; \
+	echo "NO ANSWER — the endpoint never served queue $(QUEUE_NAME)."; \
+	echo "   Either QUEUE_NAME here disagrees with poc/workflows.py, or the app did not start."; \
+	exit 1
 	@# The cutover, once the new pods are Ready: one selector field, carrying the
 	@# DBOS version. A rolling update leaves it unchanged; a major bump moves it,
 	@# and older fleets leave the endpoint list while they carry on working.
@@ -167,10 +237,12 @@ retire: ## Delete the fleet of every older version that has finished its work
 	@# Safe to run at any time, by hand or from cron, and safe to run twice at
 	@# once: deleting an object that another run already deleted is a no-op here.
 	@#
-	@# The delete takes both objects, selected by the version label. The budget
-	@# is named after the Deployment but is not owned by it, so deleting the
-	@# Deployment alone would leave one budget behind for every version ever
-	@# deployed.
+	@# The delete takes all four of a fleet's objects, selected by the version
+	@# label: Deployment, PodDisruptionBudget, per-version Service and
+	@# ScaledObject. None of the last three is owned by the Deployment, so
+	@# deleting it alone would leave three orphans behind for every version ever
+	@# deployed — and an orphaned ScaledObject keeps polling a Service with no
+	@# endpoints and logs an error every 15 seconds.
 	@#
 	@# A version whose fleet has already gone is passed over in silence. Every
 	@# version ever deployed stays in the registry, so reporting those would grow
@@ -196,14 +268,15 @@ retire: ## Delete the fleet of every older version that has finished its work
 	  elif [ "$(RETIRE_MAX_AGE_SEC)" -gt 0 ] && [ "$$age" -ge "$(RETIRE_MAX_AGE_SEC)" ]; then \
 	    echo ">> $$version: FORCING retirement with $$active workflows still active,"; \
 	    echo ">>   superseded $${age}s ago, past the $(RETIRE_MAX_AGE_SEC)s deadline."; \
-	    echo ">>   Its pods drain on SIGTERM, so work that fits inside the drain"; \
-	    echo ">>   budget still finishes. The rest is cancelled by the app, loudly."; \
+	    echo ">>   Its pods handle no signals, so that work stops where it is and"; \
+	    echo ">>   is then cancelled by the app, loudly."; \
 	  else \
 	    echo ">> $$version: keeping it, $$active workflows still active (superseded $${age}s ago)"; \
 	    continue; \
 	  fi; \
 	  echo ">> deleting the fleet is what finally sends SIGTERM to its pods"; \
-	  $(KUBECTL) delete deployment,poddisruptionbudget -l app=dbos-poc,version=$$version; \
+	  $(KUBECTL) delete deployment,poddisruptionbudget,service,scaledobject \
+	    -l app=dbos-poc,version=$$version; \
 	done <<< "$$rows"
 
 .PHONY: bump
@@ -227,9 +300,42 @@ status: ## Fleets, pods, the Service target, and the dbos schema's view of the w
 	@echo ""
 	@$(KUBECTL) get pods -L version
 	@echo ""
+	@$(MAKE) --no-print-directory scale
+	@echo ""
 	@$(PSQL) "SELECT application_version AS version, status, count(*) \
 	          FROM dbos.workflow_status GROUP BY 1,2 ORDER BY 1,2;" 2>/dev/null \
 	  || echo "(no database yet)"
+
+.PHONY: scale
+scale: ## What KEDA sees and what it decided, for every fleet
+	@# READY says the trigger is reachable, ACTIVE says the metric is above the
+	@# activation threshold, and the HPA row carries the arithmetic: the metric
+	@# value KEDA published against its target, and the replica count that
+	@# follows. If READY is False, the URL or the endpoint is wrong — the
+	@# ScaledObject's status message says which.
+	@echo "-- KEDA scalers --"
+	@$(KUBECTL) get scaledobject -l app=dbos-poc \
+	  -o custom-columns='NAME:.metadata.name,MIN:.spec.minReplicaCount,MAX:.spec.maxReplicaCount,READY:.status.conditions[?(@.type=="Ready")].status,ACTIVE:.status.conditions[?(@.type=="Active")].status' \
+	  2>/dev/null || echo "(no ScaledObject; is KEDA installed?)"
+	@echo ""
+	@# One call for each per-version Service, which is one for each live fleet:
+	@# exactly the URLs KEDA polls, answered by the same endpoint it reads.
+	@#
+	@# The service name goes in through the environment rather than into the
+	@# Python source. Interpolating it would need a double quote inside the
+	@# double-quoted -c argument, which closes it early and mangles the script.
+	@echo "-- queue depth by version, as the endpoint reports it --"
+	@pod=$$($(KUBECTL) get pod -l app=dbos-poc --field-selector=status.phase=Running -o name | head -1); \
+	for svc in $$($(KUBECTL) get service -l app=dbos-poc -o name | cut -d/ -f2); do \
+	  echo -n "$$svc: "; \
+	  $(KUBECTL) exec $$pod -c app -- env SVC=$$svc QUEUE=$(QUEUE_NAME) \
+	    /app/.venv/bin/python -c 'import os; from urllib.request import urlopen; \
+	      print(urlopen("http://%s/metrics/%s" % (os.environ["SVC"], os.environ["QUEUE"])).read().decode())' \
+	    2>/dev/null || echo "(unreachable)"; \
+	done
+	@echo ""
+	@echo "-- horizontal pod autoscalers KEDA owns --"
+	@$(KUBECTL) get hpa 2>/dev/null || true
 
 .PHONY: api
 api: ## Call the Service and report which version answered
@@ -306,25 +412,24 @@ reset: dbos_reset ## Reset the DBOS system database, then remove the app
 	@# WITH (FORCE) and takes the database out from under the running pods, so
 	@# they have to go straight after. Every version's fleet goes, selected by
 	@# label rather than by name, along with each fleet's budget — retirement
-	@# would normally remove both, but a reset does not wait for a drain.
+	@# would normally remove all four, but a reset does not wait for a version to
+	@# empty. The ScaledObject goes FIRST and on its own: while it exists, KEDA
+	@# keeps the Deployment's replica count under its control, and deleting the
+	@# two together races with the operator.
 	@# Postgres and its volume are untouched.
-	-$(KUBECTL) delete deployment,poddisruptionbudget -l app=dbos-poc \
+	-$(KUBECTL) delete scaledobject -l app=dbos-poc --ignore-not-found
+	-$(KUBECTL) delete deployment,poddisruptionbudget,service -l app=dbos-poc \
 	  --ignore-not-found --wait=false
-	@# A short grace period, not --force. Two failure modes to thread between:
+	@# The pod objects, with --force this time being the wrong choice: it removes
+	@# the object without waiting for the kubelet to kill anything, so the process
+	@# can outlive it. Those ghosts keep their queue pollers running, survive the
+	@# database drop on DBOS's retries, and start dequeuing again the moment a new
+	@# pod recreates the database — invisible to the API, but stamping their
+	@# executor id on fresh work.
 	@#
-	@#   * the pod's own grace period: on SIGTERM the app drains, and with the
-	@#     database dropped it just polls a database that no longer exists until
-	@#     the grace expires. (`--now` on the Deployment does not help — that
-	@#     sets grace on that object, not on the pods.)
-	@#   * --force --grace-period=0: removes the pod object without waiting for
-	@#     the kubelet to kill anything, so the process can outlive it. Those
-	@#     ghosts keep their queue pollers running, survive the drop on DBOS's
-	@#     retries, and start dequeuing again the moment a new pod recreates the
-	@#     database — invisible to the API, but stamping their executor id on
-	@#     fresh work.
-	@#
-	@# 5 seconds gives SIGTERM time to arrive and guarantees a SIGKILL behind it.
-	-$(KUBECTL) delete pod -l app=dbos-poc --grace-period=5 --ignore-not-found
+	@# A plain delete is enough now that the app handles no signals: SIGTERM ends
+	@# it immediately, so there is no grace period to wait out.
+	-$(KUBECTL) delete pod -l app=dbos-poc --ignore-not-found
 	-$(KUBECTL) wait --for=delete pod -l app=dbos-poc --timeout=120s
 
 .PHONY: clean

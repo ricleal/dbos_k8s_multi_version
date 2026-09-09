@@ -11,11 +11,13 @@ four things that DBOS does not supply:
 3. It deletes a version's fleet once that version owns nothing — from outside
    the cluster, in `make retire`, which cron calls every five minutes.
 4. It handles work whose version has no pods left.
+5. It sizes each fleet to its own queue depth, with KEDA. No fleet has a fixed
+   replica count.
 
-Items 1, 2 and 4 are in the application. Item 3 is not, on purpose: it is a
-write to the cluster, so it belongs to an operator. The application holds one
-cluster right, `pods: get,list`, and uses it to answer one question — has the
-executor that claimed this row gone away.
+Items 1, 2 and 4 are in the application. Items 3 and 5 are not, on purpose: both
+are writes to the cluster, so they belong to an operator and a controller. The
+application holds one cluster right, `pods: get,list`, and uses it to answer one
+question — has the executor that claimed this row gone away.
 
 Each pod is one DBOS executor (`DBOS.executor_id`). A workflow row in
 `dbos.workflow_status` carries two values that decide who can run it:
@@ -42,6 +44,7 @@ The last section is complete on its own, and it is the part to reuse.
 | [What this PoC adds](#what-this-poc-adds) | The two functions, the cron target, and the process lifecycle |
 | [With and without Conductor](#with-and-without-conductor) | The half of this PoC that Conductor replaces |
 | [Deploying a new version](#deploying-a-new-version) | The version mechanism in full. Complete on its own |
+| [Autoscaling with KEDA](#autoscaling-with-keda) | Queue depth drives the replica count of each fleet |
 | [Running it](#running-it) | Prerequisites, `make` targets, credentials |
 | [Demo](#demo) | Three scenarios with recorded output |
 | [Known limitations](#known-limitations) | What this PoC does not solve |
@@ -626,6 +629,208 @@ warning. Cancelled and loud, never abandoned and quiet.
 active produces exactly the state above, deliberately. See
 [The 24-hour deadline](#the-24-hour-deadline).
 
+## Autoscaling with KEDA
+
+No fleet has a fixed replica count. Each one is sized by
+[KEDA](https://keda.sh) from its own queue depth, following the pattern DBOS
+documents for Kubernetes:
+
+```
+desiredReplicas = ceil(queue_length / targetValue)
+```
+
+`targetValue` is 2, which is `worker_concurrency` — the number of workflows one
+pod runs at once — so the formula reads "one replica per two queued workflows",
+and a fleet grows until every waiting workflow has a slot or `MAX_REPLICAS` is
+reached.
+
+### Where the number comes from
+
+The app serves it. `GET /metrics/{queue}` returns one JSON field and KEDA's
+`metrics-api` scaler polls it every 15 seconds:
+
+```bash
+$ curl http://dbos-poc-v6/metrics/poc_queue
+{"queue_length":50,"queue_name":"poc_queue","version":"v6"}
+```
+
+**No Prometheus, and no OpenTelemetry collector.** This is what DBOS recommends,
+and the reason is worth stating: DBOS exports traces and logs over OTLP but
+**no metrics**, so a collector could not carry this number anyway. An app
+endpoint is both the documented route and the shortest one — one HTTP hop, no
+scrape interval, nothing to keep running between KEDA and the truth.
+
+### The version filter
+
+`queue_depth()` in [poc/server.py](poc/server.py) scopes the count to the
+serving pod's own `application_version`. That is this PoC's one departure from
+the DBOS recipe, and it is not optional: two fleets share one queue and one
+system database, so an unfiltered count returns the sum of both versions' work.
+Each fleet would then scale on the other's backlog. The retiring version would
+scale *up* for work it is forbidden to run — the dequeue predicate is the
+version — and would never scale down, so it would never retire.
+
+For the same reason KEDA cannot poll the main Service. That selector names one
+version and a deploy moves it, so an old fleet would vanish from it while still
+working. Each fleet therefore gets a second Service of its own, named after the
+fleet, used by nothing but its autoscaler.
+
+Measured with two fleets alive, seconds after v7 was deployed over a busy v6:
+
+```
+-- queue depth by version, as the endpoint reports it --
+dbos-poc-v6: {"queue_length":93,"queue_name":"poc_queue","version":"v6"}
+dbos-poc-v7: {"queue_length":10,"queue_name":"poc_queue","version":"v7"}
+```
+
+93 and 10, from one queue and one system database. Unfiltered, both endpoints
+would have answered 103 and both fleets would have run to the ceiling — the old
+one to work on rows it may not touch.
+
+A minute later both fleets were genuinely busy, and each was sized by its own
+number rather than the sum:
+
+```
+NAME                   REFERENCE                TARGETS         MINPODS   MAXPODS   REPLICAS   AGE
+keda-hpa-dbos-poc-v6   Deployment/dbos-poc-v6   4700m/2 (avg)   1         10        10         11m
+keda-hpa-dbos-poc-v7   Deployment/dbos-poc-v7   8800m/2 (avg)   1         10        10         57s
+```
+
+### `DELAYED` counts for retirement and not for scaling
+
+The scaling count covers `ENQUEUED` and `PENDING`. Retirement counts those and
+`DELAYED`. The difference is deliberate, and it is the only place in this repo
+where the two counts diverge:
+
+| Question | Asked by | Counts | Because |
+|---|---|---|---|
+| May this fleet go? | `make retire` | `PENDING`, `ENQUEUED`, `DELAYED` | A sleeping workflow will need a pod of its version when it wakes |
+| How many pods? | the endpoint | `PENDING`, `ENQUEUED` | A sleeping workflow needs no worker now, and paying a replica to watch it sleep is waste |
+
+### The floor is 1, never 0
+
+KEDA can scale to zero and an idle fleet would be cheaper, but
+`minReplicaCount: 0` breaks this design in a way that is hard to see. Scaling
+does not count `DELAYED`, so a fleet holding nothing but a sleeping workflow
+would scale to zero and have no pod left to wake it — while `make retire` would
+refuse to remove that fleet, because `DELAYED` *is* active work. The fleet would
+sit at zero until the 24-hour deadline. One pod is the floor; retirement is what
+removes the last one.
+
+### Why scaling down does not lose work
+
+A scale-down deletes a pod, and the pod dies at once, because nothing in this
+app handles SIGTERM. So the question matters: can KEDA remove a pod that is
+running a workflow?
+
+**Mostly it cannot, and that is a consequence of counting `PENDING`.** A
+`PENDING` row is a workflow a pod has already picked up, and the endpoint counts
+it, so in-flight work holds the replica count up. Ten saturated pods run 20
+workflows, the endpoint reports 20, and `ceil(20/2)` is 10 — exactly the pods
+already working. The floor moves down only as the work actually finishes. A
+scaling signal of `ENQUEUED` alone would not have this property: it would read 0
+the moment the queue emptied and ask for the floor while 20 workflows were still
+running.
+
+It is not airtight, because saturation is not guaranteed. In the tail of a
+drain, 12 workflows may be spread across 10 pods; `ceil(12/2)` is 6, and the
+four pods KEDA removes may each hold one. Then the second line of defence
+applies: the rows are adopted by a surviving pod of the same version within a
+sweep, from their last completed step — the same mechanism that carries a
+rolling update, described under
+[When a pod dies with work in hand](#when-a-pod-dies-with-work-in-hand). The
+floor of 1 and `maxUnavailable: 0` are what guarantee the adopter exists.
+
+**Not observed here, and the reason is instructive.** Across two full
+scale-up-and-down cycles, no pod was ever removed while holding work, so no
+adoption was needed. The stabilization window is 60s and a child workflow takes
+about 16s, so the tail of every drain finished before the window expired. To
+reach the case above you need workflows longer than the window — which is the
+normal state of affairs for real work, and the reason the second line of defence
+is there at all.
+
+### What it looks like
+
+```bash
+make scale        # what KEDA sees, and what it decided, for every fleet
+```
+
+Measured on Docker Desktop, one fleet, `MIN_REPLICAS=1` and `MAX_REPLICAS=10`:
+
+```
+-- KEDA scalers --
+NAME          MIN   MAX   READY   ACTIVE
+dbos-poc-v6   1     10    True    True
+
+-- queue depth by version, as the endpoint reports it --
+dbos-poc-v6: {"queue_length":50,"queue_name":"poc_queue","version":"v6"}
+
+-- horizontal pod autoscalers KEDA owns --
+NAME                   REFERENCE                TARGETS         MINPODS   MAXPODS   REPLICAS   AGE
+keda-hpa-dbos-poc-v6   Deployment/dbos-poc-v6   5500m/2 (avg)   1         10        10         86s
+```
+
+`READY` says the trigger is reachable and `ACTIVE` that the metric is above the
+activation threshold. `TARGETS` is the arithmetic: `5500m` is the average depth
+per pod against a target of `2`, so KEDA asked for more pods and got the
+ceiling.
+
+A fresh fleet starts at 1 replica, because the Deployment declares no count at
+all, and KEDA takes it from there. One full cycle, measured on this cluster:
+
+| Time | Depth | Replicas | |
+|---|---|---|---|
+| deploy + 20s | 10 | 1 → **4** | the first poll after the fleet's own parent enqueued its children |
+| deploy + 86s | 50 | **10** | `ceil(50/2) = 25`, capped by `MAX_REPLICAS` |
+| burst | 182 | 10 | 20 worker slots, all full: `pending` sat at exactly 20 |
+| queue empty | 0 | 10 | `ACTIVE` flips to `False`, and the stabilization window starts |
+| + 60s | 0 | **1** | back to the floor |
+
+The middle row is the one to look at: `pending` pinned at 20 across a 182-deep
+backlog is 10 pods × `worker_concurrency` 2, which is what `targetValue: 2` is
+for. The autoscaler and the queue agree on what a pod is worth.
+
+### A scale-up that creates work
+
+`parents_on_launch` is 1, so **every replica starts a parent workflow when it
+launches**, and that parent enqueues ten children. That was written for a fleet
+of a fixed three. Under an autoscaler it is a feedback loop: depth rises, KEDA
+adds a pod, the new pod adds eleven workflows, depth rises further.
+
+It is bounded — one parent per pod, and pods are bounded by `MAX_REPLICAS` — and
+it converges, because children outnumber parents ten to one and nothing else
+injects work. But it is visible. Measured over one fleet's life: **47 parents for
+a ceiling of 10 pods**, because scale-up and churn kept creating replicas and
+each one contributed a parent.
+
+For this PoC that only makes the demo livelier. In a real autoscaled app it
+would be a bug: work created on launch means the autoscaler's own action feeds
+the signal it scales on. Set `PARENTS_ON_LAUNCH=0` and inject work through the
+API instead — `make work` — if you reuse any of this.
+
+### Operating notes
+
+- **KEDA is cluster-wide.** `make keda` installs it (pinned to 2.20.2) and
+  `make infra` depends on that, because the `ScaledObject` CRD has to exist
+  before a deploy applies one. `make clean` leaves KEDA installed;
+  `make keda_uninstall` removes it.
+- **The Deployment declares no `replicas`.** A value there would fight KEDA:
+  every `kubectl apply` would reset the count and KEDA would move it back on its
+  next poll. `MIN_REPLICAS` and `MAX_REPLICAS` in the Makefile are the bounds.
+- **`TARGET_VALUE` must equal `worker_concurrency`.** They are two names for one
+  number — how many workflows a pod runs at once — and they live in different
+  files, so they can drift. If they do, the autoscaler aims at a fleet that is
+  either too small to keep up or larger than the queue can use.
+- **`make deploy` proves the URL.** After the rollout it calls
+  `/metrics/{QUEUE_NAME}` and checks that the reply names that queue. A wrong
+  queue name would not fail loudly on its own: the endpoint would answer `0` for
+  a queue nobody uses and the fleet would sit at `MIN_REPLICAS`, looking healthy.
+- **Retirement takes the autoscaler with it.** A fleet is four objects now —
+  Deployment, PodDisruptionBudget, per-version Service, ScaledObject — and
+  `make retire` deletes all four by the version label. An orphaned ScaledObject
+  would keep polling a Service with no endpoints and log an error every 15
+  seconds.
+
 ## Running it
 
 You need Docker Desktop with Kubernetes enabled, `kubectl` on the
@@ -654,24 +859,30 @@ a version is defined. The DBOS version is its major component, so only
 
 | Target | Action |
 |---|---|
-| `make help` | Lists the targets and prints the current version and replica count. This is the default goal. |
-| `make infra` | Creates the namespace, the credentials Secret, the Postgres StatefulSet, and the RBAC that the app needs (`get` and `list` on pods). Waits until Postgres is ready. |
+| `make help` | Lists the targets and prints the current version and the replica bounds. This is the default goal. |
+| `make infra` | Installs KEDA if it is absent, then creates the namespace, the credentials Secret, the Postgres StatefulSet, and the RBAC that the app needs (`get` and `list` on pods). Waits until Postgres is ready. |
+| `make keda` | Installs KEDA cluster-wide at the pinned version, or reports the version already present. Idempotent, and cluster-wide, so it survives `make clean`. |
+| `make keda_uninstall` | Removes KEDA and its CRDs, which deletes every ScaledObject with them. The Deployments keep whatever replica count they last held, and nothing scales afterwards. |
 | `make build` | Builds the image as `dbos-poc:$(VERSION)`, then imports it into the containerd store of the node. The Kubernetes node of Docker Desktop has its own image store, which is the reason `imagePullPolicy: Never` works. |
-| `make deploy` | Renders `k8s/30-app.yaml` into `.rendered/app-$(VERSION).yaml`, applies it, waits for the pods to be `Ready`, then moves the Service selector. It does not build. Prints whether this is a rolling update or a new fleet. |
-| `make retire` | Deletes the Deployment and the PodDisruptionBudget of every older version that owns no active work, or that is past `RETIRE_MAX_AGE_SEC`. **This is the cron entry point**, and the only target that a schedule should call. Safe to run at any time, and safe to run twice at once. |
+| `make deploy` | Renders `k8s/30-app.yaml` — Deployment, budget, per-version Service and ScaledObject — applies it, waits for the rollout, checks that the URL KEDA will poll answers for the expected queue, then moves the Service selector. It does not build. Prints whether this is a rolling update or a new fleet. |
+| `make retire` | Deletes all four objects of every older version that owns no active work, or that is past `RETIRE_MAX_AGE_SEC`. **This is the cron entry point**, and the only target that a schedule should call. Safe to run at any time, and safe to run twice at once. |
 | `make bump` | Increases the version in `pyproject.toml`, the only definition of a version. `PART=patch` by default, or `minor`, or `major`. Only `major` changes the DBOS version, and therefore only `major` creates a fleet. |
 | `make version` | Prints the release, the DBOS version it maps to, and the Deployment that implies. |
-| `make status` | Prints the pods with their `version` label, then the work counted by version and status from `dbos.workflow_status`. This is the reference for every result below. |
+| `make status` | Prints the fleets, the Service target, the pods with their `version` label, `make scale`, and the work counted by version and status from `dbos.workflow_status`. This is the reference for every result below. |
+| `make scale` | What KEDA sees and what it decided: each ScaledObject's readiness, the depth every per-version endpoint reports, and the HPA arithmetic behind the current replica count. |
 | `make logs` | Follows every app pod. It attaches to the pods that exist when it starts, so it exits after a rollout replaces them. Run it again. |
 | `make kill_version VER=v0` | Stops every app container of that DBOS version through the CRI of the node, with no SIGTERM and no drain. It cannot strand a version on its own, because the version's Deployment restarts what it kills — see [Scenario 1.2](#scenario-12--a-version-with-no-pods). |
 | `make dbos_reset` | Drops the DBOS system database with `dbos reset`, inside a live app pod. It needs a running Deployment, and it reports the problem if there is none. |
 | `make reset` | Runs `dbos_reset`, then deletes the Deployment and its old ReplicaSets. It keeps Postgres and its volume, so the next deploy starts with an empty database. |
 | `make clean` | Deletes the whole namespace, including the Postgres volume, and removes `.rendered/`. |
 
-You can override these variables: `REPLICAS` (default 3), `NS` (default
-`dbos-poc`), `NODE` (default `desktop-control-plane`, the node container of
-Docker Desktop), and `RETIRE_MAX_AGE_SEC` (default 86400). `VERSION` is derived
-from `pyproject.toml` and is not meant to be overridden. `make bump` is how it
+You can override these variables: `MIN_REPLICAS` (default 1), `MAX_REPLICAS`
+(default 10), `TARGET_VALUE` (default 2, and it must equal `worker_concurrency`),
+`NS` (default `dbos-poc`), `NODE` (default `desktop-control-plane`, the node
+container of Docker Desktop), `KEDA_VERSION` (default 2.20.2) and
+`RETIRE_MAX_AGE_SEC` (default 86400). There is no replica count to override —
+see [Autoscaling with KEDA](#autoscaling-with-keda). `VERSION` is derived from
+`pyproject.toml` and is not meant to be overridden. `make bump` is how it
 changes.
 
 ### Retiring old versions from cron
@@ -751,7 +962,7 @@ signal that the old fleet has been retired.
 ### One-time setup
 
 ```bash
-make infra          # namespace, Secret, Postgres, RBAC
+make infra          # KEDA, namespace, Secret, Postgres, RBAC
 make build          # build and load the image of the current version
 ```
 
@@ -1060,6 +1271,13 @@ make clean          # delete the namespace and the Postgres volume
 
 ## Known limitations
 
+- **A scale-up creates work.** Every replica starts a parent workflow, so the
+  autoscaler feeds the signal it scales on. Bounded and convergent, but a real
+  app should set `PARENTS_ON_LAUNCH=0`. See
+  [A scale-up that creates work](#a-scale-up-that-creates-work).
+- **`TARGET_VALUE` and `worker_concurrency` are one number in two files.**
+  Nothing checks that they agree. If they drift, the autoscaler aims at a fleet
+  that is too small to keep up or larger than the queue can use.
 - **Retirement is as late as the schedule.** A drained fleet idles until the
   next `make retire`, so up to five minutes of pods that have nothing to do. It
   holds no traffic and creates no work, so the cost is the pods and nothing

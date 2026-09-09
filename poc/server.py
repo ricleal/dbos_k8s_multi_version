@@ -10,6 +10,12 @@ only the first one happens at deploy time.
 So there is no readiness probe and no draining flag in this module. Readiness
 would be the wrong tool: it removes a pod from *its own* Service, which is not
 what a version cutover needs. The selector already did the work.
+
+One endpoint here is not for callers at all. ``GET /metrics/{queue}`` is the
+autoscaling signal, polled by KEDA every few seconds — see :func:`queue_depth`.
+KEDA reaches it through a second, per-version Service, precisely because the
+Service above resolves to one version only and an old fleet must still be
+scalable while it finishes its backlog.
 """
 
 import threading
@@ -45,6 +51,48 @@ def version() -> dict[str, str]:
         "version": project_version(),
         "executor": DBOS.executor_id,
         "latest": DBOS.get_latest_application_version()["version_name"],
+    }
+
+
+@app.get("/metrics/{queue_name}")
+def queue_depth(queue_name: str) -> dict[str, object]:
+    """Queue depth for KEDA, scoped to **this pod's own application version**.
+
+    The shape DBOS prescribes for the ``metrics-api`` scaler: one JSON field,
+    ``queue_length``, and KEDA computes ``ceil(queue_length / targetValue)``
+    replicas, with ``targetValue`` set to ``worker_concurrency``.
+
+    The version filter is this PoC's one departure from that recipe, and it is
+    not optional here. Two fleets share one queue and one system database, so an
+    unfiltered count returns the sum of both versions' work. Each fleet would
+    then scale on the other's backlog: the retiring version would scale *up* for
+    work it is forbidden to run — the dequeue predicate is the version — and
+    would never scale down, so it would never retire.
+
+    ``DELAYED`` is deliberately excluded, and this is the one place in this
+    codebase where it is. A workflow in a durable sleep needs a pod of its
+    version *later*, so it must keep the fleet alive: ``make retire`` counts it.
+    It needs no worker *now*, so paying for a replica to watch it sleep is
+    waste: scaling does not count it. Retirement and scaling ask different
+    questions about the same row.
+
+    ``queues_only`` also requires ``queue_name IS NOT NULL``, and a workflow
+    keeps its queue name after it finishes, so the status filter is what keeps
+    completed work out of the count.
+    """
+    depth = len(
+        DBOS.list_queued_workflows(
+            queue_name=queue_name,
+            app_version=DBOS.application_version,
+            status=["ENQUEUED", "PENDING"],
+            load_input=False,
+            load_output=False,
+        )
+    )
+    return {
+        "queue_length": depth,
+        "queue_name": queue_name,
+        "version": DBOS.application_version,
     }
 
 
